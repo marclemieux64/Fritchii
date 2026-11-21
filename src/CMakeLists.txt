@@ -159,7 +159,7 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
             $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
             # Disable RTTI (C++ only)
-            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MINGW}>>>:-fno-rtti>)
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MINGW}>>>:-frtti>)
     endif()
 
     if (ENABLE_WERROR)

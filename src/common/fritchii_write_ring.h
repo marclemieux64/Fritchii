@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -63,7 +64,7 @@ inline thread_local bool t_quiet = false;
 inline void NameThread(const char* name) noexcept {
     std::array<char, 16> chars{};
     if (name != nullptr) {
-        std::strncpy(chars.data(), name, chars.size());
+        std::memcpy(chars.data(), name, std::min(std::strlen(name), chars.size()));
     }
     std::memcpy(t_thread.data(), chars.data(), chars.size());
 }

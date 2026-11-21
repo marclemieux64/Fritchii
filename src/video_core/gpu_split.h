@@ -155,6 +155,8 @@ enum class QmdPatchOutcome : u8 {
 // EDEN_NX2_SPLIT=1 keeps the macros on the back; EDEN_NX2_SPLIT=0 runs everything on one thread.
 class GpuSplit {
 public:
+    ~GpuSplit();
+
     static GpuSplit& Get() {
         return instance;
     }
