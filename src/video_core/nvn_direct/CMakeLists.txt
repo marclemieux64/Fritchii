@@ -90,7 +90,7 @@ target_include_directories(nvn_direct PRIVATE
     ${BN}/gfx/nvn
     ${BN}/host
 )
-target_compile_definitions(nvn_direct PRIVATE __ANDROID__ _GNU_SOURCE)
+target_compile_definitions(nvn_direct PRIVATE $<$<COMPILE_LANGUAGE:C>:__ANDROID__ _GNU_SOURCE>)
 # Upstream's code is kept as it is: its warnings are not Lichii's to fix.
 target_compile_options(nvn_direct PRIVATE -w)
 target_compile_definitions(nvn_direct INTERFACE LICHII_NVN_DIRECT)
