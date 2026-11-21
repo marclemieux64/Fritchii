@@ -22,6 +22,8 @@
 #   hashes: any later edit to these files leaves it, and the build stops again until someone
 #   checks that edit too.
 
+cmake_minimum_required(VERSION 3.31)
+
 set(SkipBlocksIn "vk_graphics_pipeline.h;vk_compute_pipeline.h")
 # v6.1, kept by 6.2: Windows (CRLF checkout), Linux (LF checkout).
 set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392;65645db715012eee")
