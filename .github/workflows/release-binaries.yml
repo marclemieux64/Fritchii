@@ -300,6 +300,8 @@ jobs:
           -DUSE_DISCORD_PRESENCE=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
 
       - name: Configure macOS
         if: startsWith(matrix.platform, 'macos')
