@@ -3181,6 +3181,8 @@ struct GpuSplit::PageWatch {
     }
 };
 
+GpuSplit::~GpuSplit() = default;
+
 void GpuSplit::ClearPageWatch() {
     // Front only (or with the back stopped).
     if (page_watch) {

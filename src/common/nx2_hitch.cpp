@@ -1166,6 +1166,7 @@ void OnPresent(long long gap_us) {
 } // namespace Common::Nx2Hitch
 
 // Fritchii: Direct NVN's C code adds its times here (which: 0 = DnvnRecording ... 9 = DnvnReaderWait)
+extern "C" void fritchii_hitch_add(int which, unsigned long long ns);
 extern "C" void fritchii_hitch_add(int which, unsigned long long ns) {
     using namespace Common::Nx2Hitch;
     if (which < 0 || which > 9) {
