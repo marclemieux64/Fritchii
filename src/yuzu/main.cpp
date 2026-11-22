@@ -298,6 +298,11 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_JIT_BLOCK_LIST", "1"},     {"FRITCHII_JIT_INLINE_CNTPCT", "1"},
     {"FRITCHII_JIT_STATE_REFS", "1"},     {"FRITCHII_JIT_SHARED", "1"},
     {"FRITCHII_STORE_MEMO", "2"},
+    // 2026-11-22, Direct NVN at the Kokiri save (guest thread stats, 2 runs each): the game's job
+    // threads 32.3 -> 30.2 ms on a core a frame together with FRITCHII_JIT_UNSAFE_EXTRA=3 (not
+    // built in: it changes the game's float results). Both exact: a smaller lookup table, a
+    // cheaper idle poll.
+    {"FRITCHII_JIT_DISPATCH_BITS", "16"}, {"EDEN_NX2_IDLE_PAUSE", "1"},
     // GPU front and back
     {"EDEN_NX2_EXP37", "1"},              {"EDEN_NX2_EXP103", "64"},
     {"EDEN_NX2_EXP123", "3"},             {"EDEN_NX2_LIGHT_TABLE_ARRAYS", "1"},

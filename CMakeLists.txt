@@ -18,6 +18,22 @@ include(DetectPlatform)
 include(DetectArchitecture)
 include(DefaultConfig)
 include(UseLTO)
+
+# ThinLTO for MinGW clang builds (check_ipo_supported refuses this toolchain, so ENABLE_LTO can't).
+# Bitcode archives need llvm-ar; video_core, the kernel and fibers stay out (below and in their
+# CMakeLists): their thread_local variables lose their initialisers under ThinLTO here.
+# Direct NVN at the Kokiri save: 70.5 -> 73.0 fps with -O3 and x86-64-v3 (2026-11-22).
+option(FRITCHII_MINGW_THIN_LTO "ThinLTO for MinGW clang builds" OFF)
+if (FRITCHII_MINGW_THIN_LTO AND MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    get_filename_component(_fritchii_clang_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(FRITCHII_LLVM_AR llvm-ar HINTS "${_fritchii_clang_dir}" REQUIRED)
+    find_program(FRITCHII_LLVM_RANLIB llvm-ranlib HINTS "${_fritchii_clang_dir}" REQUIRED)
+    set(CMAKE_AR "${FRITCHII_LLVM_AR}")
+    set(CMAKE_RANLIB "${FRITCHII_LLVM_RANLIB}")
+    add_compile_options(-flto=thin)
+    add_link_options(-flto=thin)
+endif()
+
 include(FasterLinker)
 include(UseCcache)
 include(CMakeDependentOption)

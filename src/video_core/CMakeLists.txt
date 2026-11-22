@@ -692,4 +692,9 @@ if (ENABLE_NVIDIA_DLSS)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
 
+if (FRITCHII_MINGW_THIN_LTO AND MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Its header thread_local variables lose their initialisers under MinGW ThinLTO (link errors)
+    target_compile_options(video_core PRIVATE -fno-lto)
+endif()
+
 create_target_directory_groups(video_core)

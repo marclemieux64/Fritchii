@@ -308,4 +308,9 @@ if (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE M
     set_source_files_properties(fiber.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
+if (FRITCHII_MINGW_THIN_LTO AND MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # As with clang-cl's -flto above: fibers migrate between host threads
+    set_source_files_properties(fiber.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
+endif()
+
 create_target_directory_groups(common)

@@ -1332,4 +1332,9 @@ elseif (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEA
     set_source_files_properties(${lichii_kernel_sources} PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
+if (FRITCHII_MINGW_THIN_LTO AND MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # As with ENABLE_LTO above: fibers migrate between host threads
+    set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
+endif()
+
 create_target_directory_groups(core)
