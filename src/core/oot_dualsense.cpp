@@ -1880,6 +1880,10 @@ void Run(Core::System& system, u64 main_base) {
     std::string prev_shield, prev_boot, prev_armor, prev_weapon, touch_key = "master";
     float tune_l2 = 0.75f, tune_r2 = 1.0f, tune_master = 1.0f; // tuning.json's defaults
     Rgb navi_color{};
+    const bool rest_triggers = [] {
+        const char* e = std::getenv("FRITCHII_OOT_REST_TRIGGERS");
+        return e && e[0] == '1';
+    }();
     std::mt19937 rng{11};
     std::uniform_real_distribution<double> uniform{0.0, 1.0};
     std::string shield, boot, armor, map, weapon;
@@ -2385,13 +2389,17 @@ void Run(Core::System& system, u64 main_base) {
                 r = Feedback(2, 8); // empty quiver: after the dry click R2 jams
             } else if (aiming) {
                 r = Feedback(1, 2);
-            } else {
+            } else if (rest_triggers) {
                 r = Weapon(2, 4, std::clamp(8 + heavy, 1, 8));
             }
-            l = shield.find("Mirror") != std::string::npos || shield.find("Hylian") != std::string::npos
-                    ? Feedback(0, std::clamp(8 + heavy, 1, 8))
-                : shield.find("Deku") != std::string::npos ? Slope(0, 9, std::clamp(6 + heavy, 1, 8), 8)
-                                                           : Feedback(1, std::clamp(5 + heavy, 1, 8));
+            // Free at rest by default; FRITCHII_OOT_REST_TRIGGERS=1: Pulse of Time's sword click point on R2 and the
+            // shield's weight on L2 while nothing else holds the triggers
+            if (rest_triggers) {
+                l = shield.find("Mirror") != std::string::npos || shield.find("Hylian") != std::string::npos
+                        ? Feedback(0, std::clamp(8 + heavy, 1, 8))
+                    : shield.find("Deku") != std::string::npos ? Slope(0, 9, std::clamp(6 + heavy, 1, 8), 8)
+                                                               : Feedback(1, std::clamp(5 + heavy, 1, 8));
+            }
             if (ao.r) r = *ao.r;
             if (ao.l) l = *ao.l;
             if (charge > 0) r = l = Vibration(0, 2 + static_cast<int>(6 * charge), 30 + static_cast<int>(60 * charge));
