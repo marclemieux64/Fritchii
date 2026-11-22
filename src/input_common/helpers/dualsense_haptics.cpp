@@ -23,6 +23,7 @@
 #include <propsys.h>
 
 #include "common/common_types.h"
+#include "common/dualsense_effects.h"
 #include "common/logging.h"
 #include "common/thread.h"
 
@@ -220,7 +221,7 @@ void Play(IMMDevice* device) {
         {
             std::scoped_lock lock{state.mutex};
             target = state.target;
-            gain = state.gain;
+            gain = state.gain * Common::DualSenseEffects::MasterGain().load(std::memory_order_relaxed); // (the touchpad's strength)
             boom_since = state.boom_since;
         }
         const auto now = std::chrono::steady_clock::now();

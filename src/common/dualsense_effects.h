@@ -51,4 +51,23 @@ inline bool Take(u32& seen, Block& out) {
     return true;
 }
 
+/// The PS5 pad's own input as the SDL driver last saw it (Pulse of Time reads its input report): buttons in
+/// its encoding (1 square, 2 cross, 4 circle, 8 triangle, 0x10 L1, 0x20 R1, 0x40 L3, 0x80 R3), triggers and
+/// stick 0..255, D-pad 0 up clockwise to 7, 8 none, touchpad 0..1919 x 0..1079.
+struct Input {
+    std::atomic<bool> valid{false};
+    std::atomic<int> buttons{0}, l2{0}, r2{0}, lx{128}, ly{128}, dpad{8}, touch_x{0}, touch_y{0};
+    std::atomic<bool> touch_down{false}, touch_click{false};
+};
+inline Input& GetInput() {
+    static Input input;
+    return input;
+}
+
+/// The overall haptic strength the touchpad sets (Pulse of Time's "master"), read by the voice-coil haptics
+inline std::atomic<float>& MasterGain() {
+    static std::atomic<float> gain{1.0f};
+    return gain;
+}
+
 } // namespace Common::DualSenseEffects

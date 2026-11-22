@@ -615,6 +615,51 @@ void SDLDriver::CloseJoystick(SDL_Joystick* sdl_joystick) {
 void SDLDriver::PumpEvents() const {
     if (initialized) {
         SDL_PumpEvents();
+        // Fritchii: the first PS5 pad's input for game features (core/oot_dualsense.h), as Pulse of Time reads it
+        {
+            std::scoped_lock lock{joystick_map_mutex};
+            bool any = false;
+            for (const auto& [key, joysticks] : joystick_map) {
+                for (const auto& joystick : joysticks) {
+                    SDL_Gamepad* const gp = joystick->GetSDLGameController();
+                    if (any || !gp || SDL_GetGamepadType(gp) != SDL_GAMEPAD_TYPE_PS5) {
+                        continue;
+                    }
+                    any = true;
+                    auto& in = Common::DualSenseEffects::GetInput();
+                    const auto btn = [gp](SDL_GamepadButton b) { return SDL_GetGamepadButton(gp, b); };
+                    in.buttons = (btn(SDL_GAMEPAD_BUTTON_WEST) ? 0x01 : 0) | (btn(SDL_GAMEPAD_BUTTON_SOUTH) ? 0x02 : 0) |
+                                 (btn(SDL_GAMEPAD_BUTTON_EAST) ? 0x04 : 0) | (btn(SDL_GAMEPAD_BUTTON_NORTH) ? 0x08 : 0) |
+                                 (btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ? 0x10 : 0) | (btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) ? 0x20 : 0) |
+                                 (btn(SDL_GAMEPAD_BUTTON_LEFT_STICK) ? 0x40 : 0) | (btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK) ? 0x80 : 0);
+                    const auto axis8 = [gp](SDL_GamepadAxis a, bool trigger) {
+                        const int v = SDL_GetGamepadAxis(gp, a);
+                        return trigger ? std::clamp(v * 255 / 32767, 0, 255) : std::clamp((v + 32768) * 255 / 65535, 0, 255);
+                    };
+                    in.l2 = axis8(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, true);
+                    in.r2 = axis8(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, true);
+                    in.lx = axis8(SDL_GAMEPAD_AXIS_LEFTX, false);
+                    in.ly = axis8(SDL_GAMEPAD_AXIS_LEFTY, false);
+                    const bool up = btn(SDL_GAMEPAD_BUTTON_DPAD_UP), down = btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+                    const bool left = btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT), right = btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+                    in.dpad = up ? (right ? 1 : left ? 7 : 0) : down ? (right ? 3 : left ? 5 : 4) : right ? 2 : left ? 6 : 8;
+                    bool down_f = false;
+                    float x = 0, y = 0, pressure = 0;
+                    if (SDL_GetNumGamepadTouchpads(gp) > 0 && SDL_GetGamepadTouchpadFinger(gp, 0, 0, &down_f, &x, &y, &pressure)) {
+                        in.touch_down = down_f;
+                        in.touch_x = static_cast<int>(x * 1919.0f);
+                        in.touch_y = static_cast<int>(y * 1079.0f);
+                    } else {
+                        in.touch_down = false;
+                    }
+                    in.touch_click = btn(SDL_GAMEPAD_BUTTON_TOUCHPAD);
+                    in.valid = true;
+                }
+            }
+            if (!any) {
+                Common::DualSenseEffects::GetInput().valid = false;
+            }
+        }
         // Fritchii: a game feature's DualSense effects (triggers, lights: core/oot_dualsense.h) to every PS5 pad
         Common::DualSenseEffects::Block block;
         if (Common::DualSenseEffects::Take(effects_seen, block)) {
