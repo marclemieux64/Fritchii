@@ -378,5 +378,6 @@ int pthread_setname_np(pthread_t t, const char *name) {
     if (!set) set = (set_fn)(void *)GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "SetThreadDescription");
     WCHAR w[64];
     if (!set || !MultiByteToWideChar(CP_UTF8, 0, name, -1, w, (int)(sizeof w / sizeof *w))) return EINVAL;
+    if (t == pthread_self()) { extern void fritchii_sample_thread_named(const char *); fritchii_sample_thread_named(name); }   // (common/nx2_sample_profile.cpp)
     return SUCCEEDED(set(t->h ? t->h : GetCurrentThread(), w)) ? 0 : EINVAL;
 }

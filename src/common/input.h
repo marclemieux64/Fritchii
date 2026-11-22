@@ -206,6 +206,7 @@ struct VibrationStatus {
     f32 high_amplitude{};
     f32 high_frequency{};
     VibrationAmplificationType type;
+    u8 side{0xFF}; ///< 0 left, 1 right (the emulated controller's device index), else unknown
 };
 
 // Physical controller LED pattern

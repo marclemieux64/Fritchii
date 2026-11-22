@@ -21,6 +21,8 @@ add_library(input_common STATIC
     drivers/virtual_gamepad.cpp
     drivers/virtual_gamepad.h
     helpers/stick_from_buttons.cpp
+    helpers/dualsense_haptics.cpp
+    helpers/dualsense_haptics.h
     helpers/stick_from_buttons.h
     helpers/touch_from_buttons.cpp
     helpers/touch_from_buttons.h
@@ -93,3 +95,6 @@ endif()
 
 create_target_directory_groups(input_common)
 target_link_libraries(input_common PUBLIC hid_core PRIVATE common Boost::headers)
+if (WIN32)
+    target_link_libraries(input_common PRIVATE ole32)   # (helpers/dualsense_haptics.cpp: WASAPI)
+endif()

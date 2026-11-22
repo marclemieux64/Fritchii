@@ -282,3 +282,9 @@ void OnThreadNamed(const char* name) {
 }
 
 } // namespace Common::Nx2SampleProfile
+
+// Direct NVN's threads (plat_windows.c pthread_setname_np) name themselves through its own shim: forwarded here so
+// EDEN_NX2_SAMPLE_THREADS can select them (vk-replay, vk-enc, ...)
+extern "C" void fritchii_sample_thread_named(const char* name) {
+    Common::Nx2SampleProfile::OnThreadNamed(name);
+}

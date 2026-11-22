@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
+#include "input_common/helpers/dualsense_haptics.h"
 #include "input_common/drivers/sdl_driver.h"
 
 namespace InputCommon {
@@ -92,6 +93,9 @@ public:
                 : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
                     sdl_controller{game_controller, &SDL_CloseGamepad} {
         EnableMotion();
+        if (IsWiredDualSense()) {
+            DualSenseHaptics::Instance().Start(); // (its sound stream ready before the first vibration)
+        }
     }
 
     void EnableMotion() {
@@ -233,6 +237,17 @@ public:
         }
 
         return false;
+    }
+
+    bool vibration_logged = false; ///< Fritchii: the first vibration's path was logged
+
+    bool IsWiredDualSense() const {
+        if (!sdl_controller) {
+            return false;
+        }
+        const auto type = SDL_GetGamepadType(sdl_controller.get());
+        return type == SDL_GAMEPAD_TYPE_PS5 &&
+               SDL_GetGamepadConnectionState(sdl_controller.get()) == SDL_JOYSTICK_CONNECTION_WIRED;
     }
 
     bool HasHDRumble() const {
@@ -798,6 +813,25 @@ Common::Input::DriverResult SDLDriver::SetVibration(
     const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) {
     const auto joystick =
         GetSDLJoystickByGUID(identifier.guid.RawString(), static_cast<int>(identifier.port));
+
+    // Fritchii: a wired DualSense plays the game's HD rumble on its voice coils (helpers/dualsense_haptics.h)
+    if (!joystick->vibration_logged) {
+        joystick->vibration_logged = true;
+        LOG_INFO(Input, "Vibration to {}: {}", joystick->GetControllerName(),
+                 joystick->IsWiredDualSense()
+                     ? (DualSenseHaptics::Instance().Start() ? "a wired DualSense: its voice coils (DualSense haptics)"
+                                                             : "a wired DualSense: motors (FRITCHII_DUALSENSE_HAPTICS=0)")
+                     : "motors (not a DualSense on a USB cable)");
+    }
+    // No motor rumble for it, ever: SDL's rumble report turns the controller's audio haptics off until it is
+    // plugged in again (rumble emulation). Before the sound stream runs (a few ms after the start) a vibration is dropped
+    if (joystick->IsWiredDualSense() && DualSenseHaptics::Instance().Start()) {
+        DualSenseHaptics::Instance().Set(vibration.side, vibration.low_amplitude,
+                                         vibration.low_frequency, vibration.high_amplitude,
+                                         vibration.high_frequency);
+        return Common::Input::DriverResult::Success;
+    }
+
     const auto process_amplitude_exp = [](f32 amplitude, f32 factor) {
         return (amplitude + std::pow(amplitude, factor)) * 0.5f * 0xFFFF;
     };
@@ -850,6 +884,13 @@ bool SDLDriver::IsVibrationEnabled(const PadIdentifier& identifier) {
 
     if (joystick->IsVibrationTested()) {
         return joystick->HasVibration();
+    }
+
+    // Fritchii: no motor test on a wired DualSense whose voice coils play the vibration: SDL's rumble report
+    // turns the controller's audio haptics off (rumble emulation), so only the first vibration was felt
+    if (joystick->IsWiredDualSense() && DualSenseHaptics::Instance().Start()) {
+        joystick->EnableVibration(true);
+        return true;
     }
 
     // First vibration might fail
