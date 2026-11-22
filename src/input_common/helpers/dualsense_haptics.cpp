@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "input_common/helpers/dualsense_haptics.h"
+#include "common/pulse_haptics.h"
 
 #ifdef _WIN32
 
@@ -252,6 +253,8 @@ void Play(IMMDevice* device) {
         for (UINT32 f = 0; f < frames; ++f) {
             float* const frame = out + static_cast<size_t>(f) * channels;
             std::fill(frame, frame + channels, 0.0f);
+            float pulse[2];
+            Common::PulseHaptics::Render(pulse[0], pulse[1]);
             for (int s = 0; s < 2; ++s) {
                 Voice& v = voices[s];
                 const Side& t = target[s];
@@ -284,7 +287,10 @@ void Play(IMMDevice* device) {
                 const float sample =
                     norm * (v.amp_low * low_sin +
                             v.amp_high * std::sin(two_pi * static_cast<float>(v.phase_high))) + noise;
-                frame[2 + s] = std::clamp(std::clamp(sample, -1.0f, 1.0f) * 0.8f * gain, -1.0f, 1.0f);
+                // Pulse of Time's effects over the game's rumble, soft-clipped as its Haptics.Render does
+                const float master = Common::DualSenseEffects::MasterGain().load(std::memory_order_relaxed);
+                const float mixed = std::clamp(sample, -1.0f, 1.0f) * gain + std::tanh(pulse[s] * master);
+                frame[2 + s] = std::clamp(mixed * 0.8f, -0.8f, 0.8f);
                 out_peak = (std::max)(out_peak, std::abs(frame[2 + s]));
             }
         }

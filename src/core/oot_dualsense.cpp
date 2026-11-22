@@ -7,15 +7,18 @@
 // Scene.cs and Events.cs (places, songs, warps), and the trigger, light, LED and mute LED parts of Moments.cs.
 // Quad.cs (trigger bursts) with every pulse those files send, and what reads the pad's own input (R2's pull,
 // buttons, the stick, the touchpad: the bow's draw, dry fire, sword swings and the spin charge, ocarina notes,
-// struggling, a hooked fish, the pause menu, Navi's compass, the touchpad's strength). Not ported: the haptic
-// textures (Fritchii plays the game's own HD rumble) and the pulses timed by them (swim strokes, Epona's hooves).
+// struggling, a hooked fish, the pause menu, Navi's compass, the touchpad's strength). Every effect and texture
+// those files raise plays through common/pulse_haptics, over the game's own HD rumble. Not ported: what follows
+// the game's sound (its sound layer), the gyro's aim ticks and the selected-item tick (not read here).
 
 #include "core/oot_dualsense.h"
+#include "common/pulse_haptics.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <climits>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -46,6 +49,9 @@ using Effect = std::array<u8, 11>;
 using Block = Common::DualSenseEffects::Block;
 using Clock = std::chrono::steady_clock;
 constexpr double Pi = std::numbers::pi;
+
+using Common::PulseHaptics::Fx;
+using Common::PulseHaptics::Loop;
 
 // ---------- Effects (DualSense.cs) ----------
 Effect B(std::initializer_list<u8> p) {
@@ -593,7 +599,7 @@ public:
     // The active bursts over this frame's effects (a tremor alternates frame by frame with the resistance)
     void Apply(long long now, Effect& r, Effect& l) {
         frame++;
-        constexpr float gain = 1.0f; // tuning.json's triggers.tremor
+        constexpr float gain = 1.15f; // tuning.json's triggers.tremor
         float al = 0, ar = 0;
         int fl = 40, fr = 40;
         bool tl = false, tr = false;
@@ -634,6 +640,7 @@ public:
         std::optional<Rgb> light;
         float light_mix{};
         bool free_triggers{};
+        bool water{};
     };
 
     long long kick = 0, jolt = 0, r_tick = 0, flash_until = 0;
@@ -644,6 +651,7 @@ public:
     long long grabbed_until = 0, terror_until = 0;
     int grab_presses = 0;
     bool hands_busy{}, carried{};
+    float hit_scale = 1; // how hard the last hit on Link was (Daemon's damage pulse)
     float PosSpeed() const {
         return pos_vel;
     }
@@ -658,7 +666,7 @@ public:
     // paused: Pulse of Time passes no haptics then, so none of its one-shot pulses play
     Out Update(long long now, const State& s, const std::array<int, 5>& verbs,
                const std::vector<std::string>& names, const std::string& anim, float anim_frame,
-               const std::string& armor, const std::string& map, Quad& q, int buttons, int prev_buttons,
+               const std::string& armor, const std::string& map, const World& w, Quad& q, int buttons, int prev_buttons,
                bool stick_idle, bool paused) {
         before = now_set;
         now_set.clear();
@@ -673,6 +681,13 @@ public:
                 now_set.insert(name);
             }
         }
+        for (const auto& v : now_set) {
+            if (!before.contains(v)) since[v] = now;
+        }
+        const auto held = [&](const char* v) {
+            const auto it = since.find(v);
+            return it == since.end() ? 0LL : now - it->second;
+        };
         const float speed = (std::max)(s.SpeedH(), pos_vel * 0.9f);
         const auto has = [&](std::initializer_list<const char*> v) {
             for (const char* n : v) {
@@ -692,9 +707,79 @@ public:
         };
 
         const bool hx = !paused; // (Pulse of Time's haptics are on: its one-shots and pulses play)
-        if (hx) {
-            if (entered({"Drawn"})) q.Pulse(now, 0, 5, 60, 70, 200);
-            if (entered({"Sheathed"})) q.Pulse(now, 0, 3, 80, 40, 120);
+        if (hx) { // (Actions.cs's one-shot reactions on entering a verb, in its order)
+            const auto dive_before = [&] {
+                for (const char* d : {"Dive", "QuickDive", "WaterDive", "AirDive", "GuideDive"}) {
+                    if (before.contains(d)) return true;
+                }
+                return false;
+            };
+            const auto lock_before = [&] {
+                for (const auto& b : before) {
+                    if (b.starts_with("LockOn")) return true;
+                }
+                return false;
+            };
+            const auto one_two = [&] { return coin(rng) ? 2 : 1; }; // _rng.Next(1, 3)
+            const std::initializer_list<const char*> dive{"Dive", "QuickDive", "WaterDive", "AirDive", "GuideDive"};
+            if (entered({"Rolling"})) Play(Fx::Roll);
+            if (entered({"BackFlip"})) Play(Fx::Flip, 1, 1);
+            if (entered({"SideStep"})) Play(Fx::Flip, 0.8f, one_two());
+            if (entered({"Jump", "StepJump", "CliffHoldJump", "RideJump"})) Play(Fx::Jump);
+            if (entered({"WaterJump"}) || (entered(dive) && !before.contains("Swim")) || entered({"InterruptWet"})) Play(Fx::Splash);
+            if (entered({"Swim"}) && !has(dive) && !dive_before()) Play(Fx::Splash, 0.7f);
+            if (entered({"Clamber"})) {
+                Play(Fx::Grip, 1, 1, -0.7f);
+                Play(Fx::Lift);
+            }
+            if (entered({"JumpAttack", "FallAttack"})) Play(Fx::Slam);
+            if (entered({"ThrustAttack"})) Play(Fx::Thrust);
+            if (entered({"DashAttack", "LargeAttack"})) Play(Fx::Swing, 1.2f, 1);
+            if (entered({"LockOnWait", "LockOnMove"}) && !lock_before()) Play(Fx::LockOn, 1, 1, -0.4f);
+            if (entered({"OpenDoor"})) Play(Fx::DoorOpen);
+            if (entered({"BootsChange"})) Play(Fx::BootsClunk);
+            if (entered({"Lift", "PreLift"})) Play(Fx::Lift);
+            if (entered({"Throw"})) Play(Fx::Throw);
+            if (entered({"Put"})) Play(Fx::Put);
+            if (entered({"UseEmptyBottle"})) Play(Fx::Bottle);
+            if (entered({"UseDinFire"})) Play(Fx::DinFire);
+            if (entered({"UseNayruLove"})) Play(Fx::Nayru);
+            if (entered({"UseWarpItem"})) Play(Fx::Farore);
+            if (entered({"HookshotShoot", "UseHookshot"})) Play(Fx::HookshotFire);
+            if (entered({"InterruptBoomerang"})) Play(Fx::Boomerang);
+            if (entered({"BoomerangCatch"})) Play(Fx::BoomerangCatch);
+            if (entered({"InterruptGuard", "InterruptCrouchGuard", "InterruptNayruLoveGuard"})) Play(Fx::ShieldBlock, 1, 1, -0.6f);
+            if (entered({"InterruptGuardJustRepelled", "InterruptGuardAndRiposte"})) Play(Fx::Perfect, 1, 1, -0.5f);
+            if (entered({"InterruptGuardBreak", "InterruptNayruLoveGuardBreak"})) Play(Fx::GuardBreak);
+            if (entered({"InterruptRepelled"})) Play(Fx::Repelled, 1, 1, 0.5f);
+            if (entered({"InterruptSmallHit"})) hit_scale = 0.7f;
+            if (entered({"InterruptMediumHit", "InterruptStealthHit"})) hit_scale = 1.0f;
+            if (entered({"InterruptHugeHit", "InterruptSmash", "InterruptCriticalHit"})) {
+                hit_scale = 1.4f;
+                Play(Fx::Down);
+            }
+            if (entered({"InterruptDown", "InterruptDownDamage", "InterruptThrown", "InterruptThrownToOnGround"})) Play(Fx::Down);
+            if (entered({"InterruptBigFall", "InterruptFallDamage"})) Play(Fx::Land, 1.3f);
+            if (entered({"InterruptStagger"})) Play(Fx::Stagger);
+            if (entered({"InterruptStruggle", "Struggle"})) Play(Fx::Struggle);
+            if (entered({"InterruptAbyssFall"})) Play(Fx::Abyss);
+            if (entered({"InterruptFrozenBreak", "BreakFrozen"})) Play(Fx::Shatter);
+            if (entered({"InterruptLightArrow"})) Play(Fx::Chime);
+            if (entered({"InterruptOcarinaNotice"})) Play(Fx::Chime);
+            if (entered({"InterruptSongOfTheStormNoticeOutside", "InterruptSongOfTheStormNoticeInside"})) {
+                Play(Fx::Thunder);
+                q.Pulse(now, 6, 6, 30, 400, 0, true, true);
+            }
+            // the sword comes over your shoulder into your hand: hiss in the palms, then R2 closes on the grip
+            if (entered({"Drawn"})) {
+                Play(Fx::SwordDraw);
+                q.Pulse(now, 0, 5, 60, 70, 200);
+            }
+            if (entered({"Sheathed"})) {
+                Play(Fx::Sheathe);
+                q.Pulse(now, 0, 3, 80, 40, 120);
+            }
+            if ((has({"Talk"}) || anim.starts_with("EvtTalk")) && (buttons & 4) != 0 && (prev_buttons & 4) == 0) Play(Fx::TextTick);
             if (entered({"JumpAttack", "FallAttack"})) q.Pulse(now, 8, 8, 35, 150, 200);
             if (entered({"ThrustAttack"})) q.Pulse(now, 2, 7, 70, 60);
             if (entered({"Rolling"})) {
@@ -704,26 +789,67 @@ public:
             if (entered({"InterruptGuard", "InterruptCrouchGuard"})) q.Pulse(now, 8, 3, 35, 140, 0, true, true);
             if (entered({"InterruptRepelled"})) q.Pulse(now, 0, 8, 90, 90);
             if (entered({"OpenDoor"})) q.Pulse(now, 4, 4, 25, 700, 0, false, true);
-            if (entered({"InterruptSongOfTheStormNoticeOutside", "InterruptSongOfTheStormNoticeInside"})) q.Pulse(now, 6, 6, 30, 400, 0, true, true);
-            if (entered({"Dash"})) q.Pulse(now, 3, 3, 45, 90);
+            // the remake's moves
+            if (entered({"Dash"})) {
+                Play(Fx::Dash);
+                q.Pulse(now, 3, 3, 45, 90);
+            }
+            if (entered({"DashUp"})) {
+                Play(Fx::Jump, 1.1f);
+                Play(Fx::Dash, 0.7f);
+            }
             if (entered({"DodgeAttack"})) {
-                const int d = coin(rng) ? 2 : 1;
+                const int d = one_two();
+                Play(Fx::Dodge, 1, d);
                 q.Pulse(now, d == 2 ? 4 : 0, d == 1 ? 4 : 0, 80, 60);
             }
-            if (entered({"BackStep"})) q.Pulse(now, 2, 2, 60, 50, 60);
-            if (entered({"WallJump"})) {
+            if (entered({"BackStep"})) {
+                Play(Fx::Dodge, 0.9f, one_two());
+                q.Pulse(now, 2, 2, 60, 50, 60);
+            }
+            if (entered({"WallJump"})) { // kicking off one wall, then the other
                 wall_side = -wall_side;
+                Play(Fx::WallKick, 1, 1, 0.7f * wall_side);
                 q.Pulse(now, wall_side < 0 ? 6 : 0, wall_side > 0 ? 6 : 0, 60, 70);
             }
-            if (entered({"ContinuousJump01", "ContinuousJump02", "TurnJump"})) {
+            if (entered({"WallSlip"})) Play(Fx::Slip, 0.7f, one_two());
+            if (entered({"ContinuousJump01", "ContinuousJump02", "TurnJump"})) { // a chain of jumps climbs like a scale
                 chain = now - last_chain < 1500 ? (std::min)(chain + 1, 6) : 1;
                 last_chain = now;
+                Play(Fx::ChainJump, 1, chain);
                 q.Pulse(now, 1.0f + chain, 1.0f + chain, 60 + 20 * chain, 50);
             }
-            if (entered({"RideJumpAttack"})) q.Pulse(now, 8, 8, 35, 150, 200);
-            if (entered({"InterruptCrashedByObject"})) q.Pulse(now, 8, 8, 35, 140);
-            if (entered({"InterruptFallFromRidable", "ForceDismount"})) q.Pulse(now, 5, 5, 35, 120);
-            if (entered({"InterruptHammer"})) q.Pulse(now, 8, 8, 30, 160);
+            if (entered({"SlideLand"})) Play(Fx::SlideLand);
+            if (entered({"QuickTurn"})) Play(Fx::QuickTurn, 1, one_two());
+            if (entered({"JumpToCeiling"})) Play(Fx::Jump, 1.1f);
+            if (entered({"JumpOffCeiling"})) Play(Fx::Flip, 0.8f);
+            if (entered({"RideJumpAttack"})) {
+                Play(Fx::Slam, 1.2f);
+                q.Pulse(now, 8, 8, 35, 150, 200);
+            }
+            if (entered({"InterruptCrashedByObject"})) {
+                Play(Fx::Crash);
+                q.Pulse(now, 8, 8, 35, 140);
+            }
+            if (entered({"InterruptSlip"})) Play(Fx::Slip, 1, one_two());
+            if (entered({"InterruptFallFromRidable", "ForceDismount"})) {
+                Play(Fx::Down, 1.2f);
+                q.Pulse(now, 5, 5, 35, 120);
+            }
+            if (entered({"InterruptDrown"})) Play(Fx::DeathDrown, 0.8f);
+            if (entered({"InterruptHammer"})) {
+                Play(Fx::Hammer);
+                q.Pulse(now, 8, 8, 30, 160);
+            }
+            if (entered({"PickUp"})) Play(Fx::PickUp);
+            if (entered({"LiftDrop"})) Play(Fx::Put, 1.2f);
+            if (entered({"PutAway"})) Play(Fx::Sheathe, 0.7f);
+            if (entered({"UseScrubBusinessSeed"})) Play(Fx::Put, 0.8f);
+            if (entered({"AttachChemical", "InterruptLightChemical"})) Play(Fx::Ignite);
+            if (entered({"Fishing"})) Play(Fx::Cast);
+            if (entered({"ChangeLure"})) Play(Fx::PickUp);
+            if (entered({"InterruptGuardFaile"})) Play(Fx::GuardBreak, 0.8f);
+            if (entered({"InterruptGuardBeam"})) Play(Fx::ShieldBlock, 1.1f, 1, -0.6f);
         }
         // one-shot reactions that reach the triggers and the light (the sounds are Pulse of Time's own)
         if (entered({"InterruptGuard", "InterruptCrouchGuard", "InterruptNayruLoveGuard"})) {
@@ -789,21 +915,30 @@ public:
         const bool terror = now < terror_until;
         if (grabbed && !was_grabbed) {
             grab_presses = 0;
-            if (hx) q.Pulse(now, 8, 8, 30, 120);
+            if (hx) {
+                Play(Fx::Grabbed);
+                q.Pulse(now, 8, 8, 30, 120);
+            }
         }
         if (grabbed && (buttons & ~prev_buttons & 0x3F) != 0) { // every button mashed jerks against the grip
             grab_presses++;
             const bool left = grab_presses % 2 == 0;
-            if (hx) q.Pulse(now, left ? 6 : 0, left ? 0 : 6, 60, 70);
+            if (hx) {
+                Play(Fx::Struggle, 0.6f);
+                q.Pulse(now, left ? 6 : 0, left ? 0 : 6, 60, 70);
+            }
         }
         if (grabbed && entered({"ReleaseRestraint", "Unstick"})) {
             grabbed_until = 0;
             grabbed = false;
         }
+        if (!grabbed && was_grabbed && hx) Play(Fx::Breakfree); // once, however the grip ended
         if (terror && !was_terror) {
+            if (hx) Play(Fx::Terror);
             flash_color = {150, 150, 160};
             flash_until = now + 250;
         }
+        if (!terror && was_terror && hx) Play(Fx::Breakfree, 0.7f);
         if (terror && hx) q.Pulse(now, 2, 2, 220, 30, 0, false, true);
         was_grabbed = grabbed;
         was_terror = terror;
@@ -818,6 +953,7 @@ public:
         if (has({"InterruptFrozen", "FrozenInIce", "FeelCold"})) freeze_until = now + 400;
         if (has({"InterruptShock", "InterruptParalyze", "InterruptSleepParalysis"})) shock_until = now + 300;
         if (has({"InterruptEaten"})) squeeze_until = now + 300;
+        if (has({"InterruptStrongGust", "InterruptWeakGust", "InterruptGust"})) wind_until = now + 300;
 
         const bool swim = has({"Swim"}), under = has({"Dive", "QuickDive", "WaterDive", "AirDive", "GuideDive"});
         const bool climb = has({"Climb", "ClimbLadder"}), cliff = has({"CliffHold"});
@@ -827,18 +963,52 @@ public:
         const bool talk = has({"Talk", "Listen"}), sleep = has({"Sleep"}), fishing = has({"Fishing"});
         const bool hook = has({"HookshotShoot", "UseHookshot"}), falling = has({"Fall"}) && s.vy < -4.0f;
         const bool burn = now < burn_until, frozen = now < freeze_until, shock = now < shock_until,
-                   squeeze = now < squeeze_until;
+                   squeeze = now < squeeze_until, wind = now < wind_until;
 
         // breath: without the Zora tunic a dive gets harder the longer it lasts
         const bool zora = armor.find("Zora") != std::string::npos;
         if (under) {
             if (dive_start < 0) dive_start = now;
-        } else {
+        } else if (dive_start >= 0) {
+            if (!zora && now - dive_start > 6000 && hx) Play(Fx::AirGasp);
             dive_start = -1;
         }
         const float dive_sec = dive_start >= 0 ? (now - dive_start) / 1000.0f : 0.0f;
         const float pressure = zora ? 0.4f : (std::min)(1.0f, dive_sec / 20.0f);
         air_left = under && !zora ? (std::max)(0.0f, 1 - dive_sec / 20.0f) : -1;
+
+        // continuous textures (none while paused: Pulse of Time passes no haptics then)
+        auto& P = Common::PulseHaptics::GetParams();
+        const auto L = [&](Loop k, float v) { P.loops[static_cast<int>(k)].store(hx ? v : 0.0f, std::memory_order_relaxed); };
+        L(Loop::Swim, swim && !under ? 0.5f + (std::min)(0.5f, speed / 4.0f) : 0);
+        P.swim_rate = 0.5f + speed * 0.25f;
+        L(Loop::Underwater, under ? 0.6f + 0.7f * pressure : 0);
+        P.muffle = under;
+        // each stroke reaches forward: the trigger on the side the wave starts gets a soft pull of water
+        if (swim && !under && hx) {
+            const long long stroke = static_cast<long long>(std::floor(P.swim_phase.load()));
+            if (stroke != last_stroke) {
+                last_stroke = stroke;
+                const bool odd = stroke % 2 == 1;
+                q.Pulse(now, odd ? 0 : 3, odd ? 3 : 0, 25, 260, 0, true, true);
+            }
+        }
+        L(Loop::FallWind, falling ? std::clamp((-s.vy - 4.0f) / 12.0f, 0.1f, 1.0f) : 0);
+        L(Loop::Burn, burn ? 1 : 0);
+        L(Loop::Frozen, frozen ? 1 : 0);
+        L(Loop::Shock, shock ? 1 : 0);
+        L(Loop::Squeeze, squeeze ? 1 : 0);
+        float wind_lvl = wind ? 0.8f : 0;
+        L(Loop::Strain, cliff ? (std::min)(1.0f, 0.3f + held("CliffHold") / 4000.0f) : 0);
+        L(Loop::Grind, push && speed > 0.05f ? 0.7f : push ? 0.15f : 0);
+        const float slide_lvl = slide ? 0.8f : 0;
+        L(Loop::Crawl, crawl && speed > 0.1f ? 0.7f : 0);
+        P.loop_speed = speed;
+        L(Loop::Hooves, has({"Ride"}) && speed > 1 ? (std::min)(1.0f, 0.35f + speed / 14.0f) : 0);
+        P.hoof_rate = std::clamp(speed / 4.5f, 1.1f, 4.0f);
+        L(Loop::Rain, rain_until > 0 && !w.indoor ? 0.8f : 0);
+        P.rain_roof = w.under_roof;
+        float note = 0;
 
         // ocarina: each note button's colour flash, and its place in the triggers, humming its pitch
         if (music && hx) {
@@ -851,7 +1021,10 @@ public:
                                                         {32, 224, {255, 190, 20}}, {1, 252, {255, 170, 40}}, {8, 300, {255, 230, 60}}}};
             for (const auto& n : Notes) {
                 if ((buttons & n.btn) == 0) continue;
+                note = 1;
+                P.note_hz = n.hz;
                 if ((prev_buttons & n.btn) == 0) {
+                    Play(Fx::NoteOn);
                     note_color = n.col;
                     note_flash_until = now + 350;
                 }
@@ -861,6 +1034,7 @@ public:
                 q.Pulse(now, static_cast<float>(al), static_cast<float>(ar), f, 40, 0, false);
             }
         }
+        L(Loop::Note, note);
         // movement from Link's position (animation-driven moves show only there)
         const float dt = std::clamp((now - last_t) / 1000.0f, 0.001f, 0.1f);
         const float dx = s.x - last_x, dy = s.y - last_y, dz = s.z - last_z;
@@ -872,7 +1046,10 @@ public:
         // hookshot flight: the chain pulls Link fast toward the target
         if (hook) hook_t = now;
         const bool fly_now = now - hook_t < 2500 && pos_vel > 6.0f;
+        wind_lvl = (std::max)(wind_lvl, fly_now ? 0.9f : 0.0f);
         if (fly_now && !flying_state && hx) { // the hook bites, then the pull runs from the fingertips back
+            Play(Fx::Bite, 0.8f, 1, 0.4f);
+            Play(Fx::ChainRattle, 1.3f);
             q.Pulse(now, 0, 8, 120, 60);
             q.Pulse(now, 5, 5, 40, 200, 80, true, true);
         }
@@ -884,7 +1061,11 @@ public:
             flying_state = true;
         } else if (flying_state && pos_vel < 3.0f) {
             flying_state = false;
-            if (hx) q.Pulse(now, 6, 6, 45, 110);
+            if (hx) {
+                Play(Fx::Arrive, 1.1f);
+                q.Pulse(now, 6, 6, 45, 110);
+                Common::PulseHaptics::Duck(250);
+            }
         }
         // a moving platform: Link stands still (no stick, no action) but the world carries him
         bool idle_verb = true;
@@ -898,6 +1079,14 @@ public:
                                  !now_set.contains("Swim") && !now_set.contains("Climb") && !now_set.contains("ClimbLadder");
         carry_t = carried_now ? (carry_t < 0 ? now : carry_t) : -1;
         carried = carry_t >= 0 && now - carry_t > 250;
+        L(Loop::Motor, carried ? (std::min)(1.0f, 0.35f + pos_vel / 3.0f) : 0);
+        P.motor_up = std::clamp(pos_vy / 2.0f, -1.0f, 1.0f);
+        if (carried) {
+            rode_for = now - carry_t;
+        } else {
+            if (rode_for > 1000 && hx) Play(Fx::Arrive, 0.7f);
+            rode_for = 0;
+        }
         flying = flying_state;
 
         // ice: the ground slides away; quicksand: a slow pull down
@@ -905,6 +1094,9 @@ public:
         slippery = icy && speed > 1 && !swim && !climb;
         const bool sandy = ContainsI(map, "Wasteland") || ContainsI(map, "Hounted");
         sinking = sandy && pos_vy < -0.05f && pos_vy > -1.5f && !has({"Fall", "Jump"});
+        L(Loop::Wind, wind_lvl);
+        L(Loop::Slide, (std::max)(slide_lvl, slippery ? 0.35f : 0.0f));
+        L(Loop::Sink, sinking ? 0.9f : 0);
 
         // climbing: one grip per hand movement, hand over hand
         if (climb) {
@@ -917,7 +1109,10 @@ public:
                 grip_side = 1;
             }
             if (grip && now - last_grip > 130) {
-                if (hx) q.Pulse(now, grip_side < 0 ? 4 : 0, grip_side > 0 ? 4 : 0, 110, 45, 0, true, true);
+                if (hx) {
+                    Play(Fx::Grip, 1, 1, 0.8f * grip_side);
+                    q.Pulse(now, grip_side < 0 ? 4 : 0, grip_side > 0 ? 4 : 0, 110, 45, 0, true, true);
+                }
                 grip_pulse_until = now + 150;
                 grip_side = -grip_side;
                 climb_travel = 0;
@@ -1060,6 +1255,7 @@ public:
         o.light = light;
         o.light_mix = std::clamp(mix, 0.0f, 1.0f);
         o.free_triggers = free;
+        o.water = swim || under;
         return o;
     }
 
@@ -1068,7 +1264,9 @@ private:
     std::unordered_map<std::string, long long> seen;
     std::mt19937 rng{3};
     std::uniform_real_distribution<double> uniform{0.0, 1.0};
-    long long burn_until = 0, freeze_until = 0, shock_until = 0, squeeze_until = 0, nayru_until = 0;
+    long long burn_until = 0, freeze_until = 0, shock_until = 0, squeeze_until = 0, nayru_until = 0, wind_until = 0;
+    long long last_stroke = LLONG_MIN, rode_for = 0;
+    std::unordered_map<std::string, long long> since;
     long long fade_abyss = 0, rain_until = 0, grip_pulse_until = 0, dive_start = -1, last_grip = 0, last_t = 0;
     long long hook_t = -100000;
     int grip_side = 1;
@@ -1347,10 +1545,33 @@ private:
 class Scene {
 public:
     enum class Theme { None, Fire, Water, Organic, Forest, Shadow, Desert, Ice, Ganon, Holy, Dream };
-    void SetMap(const std::string& map) {
+    void SetMap(const std::string& map, long long now) {
         if (map == current_map) return;
         current_map = map;
         theme = Classify(map);
+        next_ambient = now + 3000;
+    }
+    bool Fire() const {
+        return theme == Theme::Fire;
+    }
+    /// The next ambient touch for the place, if one is due
+    std::optional<std::pair<Fx, float>> Ambient(long long now) {
+        if (now < next_ambient || theme == Theme::None) return std::nullopt;
+        const bool waste = current_map.find("Wasteland") != std::string::npos;
+        Fx fx;
+        int lo, hi;
+        switch (theme) {
+        case Theme::Fire: fx = Fx::AmbLava, lo = 3000, hi = 7000; break;
+        case Theme::Water: fx = Fx::AmbDrip, lo = 2000, hi = 5000; break;
+        case Theme::Organic: fx = Fx::AmbOrganic, lo = 1600, hi = 1600; break;
+        case Theme::Shadow: fx = Fx::AmbEerie, lo = 8000, hi = 14000; break;
+        case Theme::Desert: fx = Fx::AmbSand, lo = waste ? 2000 : 4000, hi = waste ? 4000 : 9000; break;
+        case Theme::Ice: fx = Fx::AmbCrystal, lo = 3000, hi = 6000; break;
+        case Theme::Ganon: fx = Fx::AmbThunder, lo = 12000, hi = 25000; break;
+        default: return std::nullopt;
+        }
+        next_ambient = now + std::uniform_int_distribution<int>{lo, hi}(rng);
+        return std::pair{fx, static_cast<float>(uniform(rng) * 1.6 - 0.8)};
     }
     std::optional<Rgb> Light(long long now) {
         const double t = now / 1000.0;
@@ -1422,7 +1643,7 @@ private:
     Theme theme = Theme::None;
     std::mt19937 rng{7};
     std::uniform_real_distribution<double> uniform{0.0, 1.0};
-    long long sparkle_until = 0;
+    long long sparkle_until = 0, next_ambient = 0;
     float flicker = 1;
 };
 
@@ -1455,34 +1676,128 @@ public:
             light_until = now + ms;
             sweep_day = false;
         };
-        if (has({"Ocarina", "Melody", "Warp"})) {
-            if (has({"SunSong", "Sun"})) { sweep_day = true; light_from = now; light_until = now + 3500; q.Pulse(now, 3, 3, 25, 2500, 0, false, true); return; }
-            if (has({"Storm"})) { act.StartRain(now, 90000); glow(200, 210, 255, 400); q.Pulse(now, 7, 7, 30, 500, 0, true, true); return; }
-            if (has({"Epona"})) { glow(255, 170, 90, 4500); return; }
-            if (has({"Saria"})) { glow(60, 255, 90, 2500); return; }
-            if (has({"Zelda", "Lullaby"})) { glow(255, 215, 90, 3000); return; }
-            if (has({"SongOfTime", "TimeSong", "Time"})) { glow(170, 210, 255, 3000); q.Pulse(now, 5, 5, 25, 1200, 0, true, true); return; }
-            if (has({"Minuet", "Forest"})) { glow(40, 255, 70, 3000); return; }
-            if (has({"Bolero", "Fire"})) { glow(255, 70, 0, 3000); q.Pulse(now, 6, 6, 40, 500); return; }
-            if (has({"Serenade", "Water"})) { glow(40, 120, 255, 3000); return; }
-            if (has({"Nocturne", "Shadow"})) { glow(110, 20, 170, 3000); return; }
-            if (has({"Requiem", "Spirit"})) { glow(255, 150, 40, 3000); return; }
-            if (has({"Prelude", "Light"})) { glow(255, 250, 200, 3000); return; }
-            if (has({"Scarecrow"})) return;
-            if (has({"Warp"})) { glow(120, 200, 255, 2500); return; }
+        if (has({"Ocarina", "Melody", "Warp"})) { // every song has its own feel; warp songs carry you off in their temple's colour
+            if (has({"SunSong", "Sun"})) {
+                Play(Fx::Sunrise);
+                sweep_day = true;
+                light_from = now;
+                light_until = now + 3500;
+                q.Pulse(now, 3, 3, 25, 2500, 0, false, true);
+                return;
+            }
+            if (has({"Storm"})) {
+                Play(Fx::Thunder);
+                act.StartRain(now, 90000);
+                glow(200, 210, 255, 400);
+                q.Pulse(now, 7, 7, 30, 500, 0, true, true);
+                return;
+            }
+            if (has({"Epona"})) { // she comes galloping from afar
+                hooves_from = now;
+                hooves_until = now + 4500;
+                glow(255, 170, 90, 4500);
+                return;
+            }
+            if (has({"Saria"})) {
+                Play(Fx::Chime);
+                Play(Fx::Farore, 0.6f);
+                glow(60, 255, 90, 2500);
+                return;
+            }
+            if (has({"Zelda", "Lullaby"})) {
+                Play(Fx::Nayru);
+                Play(Fx::Chime);
+                glow(255, 215, 90, 3000);
+                return;
+            }
+            if (has({"SongOfTime", "TimeSong", "Time"})) {
+                Play(Fx::Appear, 1.2f);
+                glow(170, 210, 255, 3000);
+                q.Pulse(now, 5, 5, 25, 1200, 0, true, true);
+                return;
+            }
+            if (has({"Minuet", "Forest"})) {
+                Play(Fx::Farore);
+                glow(40, 255, 70, 3000);
+                return;
+            }
+            if (has({"Bolero", "Fire"})) {
+                Play(Fx::DinFire);
+                glow(255, 70, 0, 3000);
+                q.Pulse(now, 6, 6, 40, 500);
+                return;
+            }
+            if (has({"Serenade", "Water"})) {
+                Play(Fx::Splash, 1.2f);
+                Play(Fx::Farore, 0.7f);
+                glow(40, 120, 255, 3000);
+                return;
+            }
+            if (has({"Nocturne", "Shadow"})) {
+                Play(Fx::AmbEerie, 1.3f);
+                glow(110, 20, 170, 3000);
+                return;
+            }
+            if (has({"Requiem", "Spirit"})) {
+                Play(Fx::AmbSand, 1.3f);
+                Play(Fx::Farore, 0.6f);
+                glow(255, 150, 40, 3000);
+                return;
+            }
+            if (has({"Prelude", "Light"})) {
+                Play(Fx::Chime);
+                Play(Fx::Nayru);
+                glow(255, 250, 200, 3000);
+                return;
+            }
+            if (has({"Scarecrow"})) {
+                Play(Fx::Chime);
+                return;
+            }
+            if (has({"Warp"})) {
+                Play(Fx::Farore);
+                glow(120, 200, 255, 2500);
+                return;
+            }
             return;
         }
         if (has({"Boss"}) && has({"Appear", "Demo", "Start", "Encount", "Opening"})) {
             for (int i = 0; i < 3; i++) q.Pulse(now, 6, 6, 30, 90, i * 650, false, true); // three slow heavy heartbeats
+            Play(Fx::Heartbeat, 1.3f);
             glow(200, 0, 20, 3000);
             return;
         }
-        if (has({"SageOf", "Sage_"})) { glow(255, 255, 255, 3000); return; }
-        if (has({"GameOver"})) { glow(60, 0, 0, 3000); return; }
-        if (has({"FallDown"})) { glow(0, 0, 0, 1500); return; }
-        if (has({"BancChange"})) { glow(0, 0, 0, 700); return; }
+        if (has({"SageOf", "Sage_"})) {
+            Play(Fx::MedalGet);
+            glow(255, 255, 255, 3000);
+            return;
+        }
+        if (has({"GameOver"})) {
+            Play(Fx::Death);
+            glow(60, 0, 0, 3000);
+            return;
+        }
+        if (has({"FallDown"})) {
+            Play(Fx::Abyss);
+            glow(0, 0, 0, 1500);
+            return;
+        }
+        if (has({"BancChange"})) { // through a door / exit: the world fades
+            Play(Fx::MenuOpen, 0.8f);
+            glow(0, 0, 0, 700);
+            return;
+        }
+        if (has({"TBox", "TreasureBox", "Dm_SY_Get"})) { // the chest: anticipation before the item
+            Play(Fx::Lift, 0.8f);
+            return;
+        }
+        if (has({"GossipStone"})) {
+            Play(Fx::AmbEerie, 0.8f);
+            return;
+        }
         if (has({"Defeat_"})) { glow(255, 220, 120, 3000); return; }
     }
+    long long hooves_from = 0, hooves_until = 0; // Epona's Song
     std::optional<Rgb> LightNow(long long now) const {
         if (now >= light_until) return std::nullopt;
         if (sweep_day) {
@@ -1500,18 +1815,52 @@ private:
     long long light_from = 0, light_until = 0;
 };
 
+// Moments.MaterialOf: the ground under Link, for the impacts' texture
+Common::PulseHaptics::Mat MaterialOf(const std::string& map, bool indoor, bool water) {
+    using Common::PulseHaptics::Mat;
+    const auto has = [&](std::initializer_list<std::string_view> k) {
+        for (const auto x : k) {
+            if (ContainsI(map, x)) return true;
+        }
+        return false;
+    };
+    if (water) return Mat::Water;
+    if (has({"IceCavern", "Ice_"})) return Mat::Ice;
+    if (has({"JabuJabu"})) return Mat::Flesh;
+    if (has({"DekuTree", "ShadowTemple_Ship"})) return Mat::Wood;
+    if (has({"Desert", "Wasteland", "Colossus", "Hounted"})) return Mat::Sand;
+    if (indoor && has({"Market", "Kakariko", "Kokiri", "LonLon", "House", "Shop"})) return Mat::Wood;
+    if (has({"Temple", "Cavern", "Well", "Castle", "Ganon", "Tower", "Dungeon", "Crater", "Graveyard", "Tomb", "Dream", "Training"})) return Mat::Stone;
+    if (has({"Kokiri", "LostWood", "SacredForest", "Field", "LonLon", "Lake", "Zora", "Forest", "Gerudo"})) return Mat::Grass;
+    return Mat::Stone;
+}
+
 // ---------- Moments.cs: story, minigames and places (the parts that reach triggers, light, LEDs, mute LED) ----------
 class Moments {
 public:
     std::optional<Effect> r, l; // trigger overrides this frame
     float bar = -1;             // player-LED bar (0..1), -1 = none
     u8 mic = 0;
-    bool child{}, dream{}, escaping{}, racing{}, on_ship{};
+    bool child{}, dream{}, escaping{}, racing{}, on_ship{}, masked{};
+
+    /// A shot from the bow or slingshot during a score game: if the score doesn't move, it missed
+    void Shot(long long now) {
+        if (now < score_game_until) {
+            shot_at = now;
+            score_at_shot = last_score;
+        }
+    }
 
     void Update(long long now, GameData& gd, Actions& act, const State& s, const std::string& map,
                 const Combat* cb, const std::string& weapon, bool paused, Quad& q, float pull) {
         quad = &q;
         now_ms = now;
+        hx = !paused; // (Pulse of Time passes no haptics while paused)
+        auto& hp = Common::PulseHaptics::GetParams();
+        const auto loop = [&](Loop k) -> std::atomic<float>& { return hp.loops[static_cast<int>(k)]; };
+        const auto set_loop = [&](Loop k, float v) {
+            if (hx) loop(k) = v;
+        };
         r.reset();
         l.reset();
         bar = -1;
@@ -1537,8 +1886,15 @@ public:
         if (timer_on && timer_left >= 0 && !paused) {
             const int sec = static_cast<int>(std::ceil(timer_left));
             if (sec != last_second && last_second >= 0 && sec >= 0) {
-                if (sec <= 3) q.Pulse(now, 6, 6, 30, 70, 0, false, true);
-                else if (sec <= 10) q.Pulse(now, 2, 2, 200, 25);
+                if (sec <= 3) {
+                    Play(Fx::Heartbeat, 1.1f);
+                    q.Pulse(now, 6, 6, 30, 70, 0, false, true);
+                } else if (sec <= 10) {
+                    Play(Fx::TimerTick, 0.8f + 0.05f * (10 - sec), 2);
+                    q.Pulse(now, 2, 2, 200, 25);
+                } else if (sec % 5 == 0) {
+                    Play(Fx::TimerTick, 0.5f);
+                }
             }
             last_second = sec;
             if (timer_frac >= 0) bar = timer_frac;
@@ -1546,12 +1902,18 @@ public:
             last_second = -1;
         }
         if (!timer_on && now < score_game_until && timer_frac >= 0) bar = timer_frac;
+        if (now < score_game_until && shot_at > 0 && now - shot_at > 1500) { // the shot hit nothing
+            if (last_score == score_at_shot && hx) Play(Fx::Miss);
+            shot_at = 0;
+        }
 
         // the collapsing castle: the mute LED stays on
         escaping = now < escape_until && in_map({"Ganon"});
         if (escaping && !paused) {
+            loop(Loop::Quake) = (std::max)(loop(Loop::Quake).load(), 0.35f); // the ground shakes
             if (now >= next_debris) { // rubble falls all around
                 const auto pl = Quad::Place(static_cast<float>(uniform(rng) * 2 - 1), static_cast<float>(uniform(rng) * 2 - 1), 0.8f);
+                Play(Fx::Debris, (std::max)(0.4f, pl.palm), 1, pl.pan);
                 q.Pulse(now, pl.l2, pl.r2, 35, 90);
                 next_debris = now + 500 + static_cast<long long>(uniform(rng) * 1500);
             }
@@ -1559,10 +1921,32 @@ public:
         }
 
         // a ship rocks: the weight shifts from one trigger to the other (not while fighting)
+        set_loop(Loop::Rock, on_ship || (in_map({"ShadowTemple"}) && act.carried) ? 0.8f : 0.0f);
         if (on_ship && !paused && (cb == nullptr || cb->nearest_distance > 8)) {
             const float a = static_cast<float>(std::sin(2 * Pi * 0.22 * now / 1000.0));
             l = Feedback(0, 2 + static_cast<int>(std::round(3 * (0.5f - 0.5f * a))));
             r = Feedback(0, 2 + static_cast<int>(std::round(3 * (0.5f + 0.5f * a))));
+        }
+
+        // the race: hooves a notch stronger
+        if (racing && hx) loop(Loop::Hooves) = (std::min)(1.3f, loop(Loop::Hooves).load() * 1.3f);
+        // angry cuccos: the swarm, and single hard pecks on top of it from any side
+        const bool cuccos = flags[H("Cucco_IsAngry")];
+        set_loop(Loop::Swarm, cuccos ? 1.0f : 0.0f);
+        if (cuccos && hx && now >= next_peck) {
+            Play(Fx::Peck, 0.6f + 0.4f * static_cast<float>(uniform(rng)), 1, static_cast<float>(uniform(rng) * 2 - 1));
+            next_peck = now + std::uniform_int_distribution<int>{150, 499}(rng);
+        }
+        // holding a cucco and gliding
+        set_loop(Loop::Flap, act.HasVerb("AnimalGlide") ? 0.9f : 0.0f);
+        // Poes: a cold shimmer from where they float
+        if (cb && hx) {
+            const Combat::Foe* poe = nullptr;
+            for (const auto& f : cb->live) {
+                if (f.name.find("Poe") != std::string::npos && f.distance < 15 && (poe == nullptr || f.distance < poe->distance)) poe = &f;
+            }
+            loop(Loop::Ghost) = poe ? 1 - poe->distance / 15 : 0.0f;
+            if (poe) hp.ghost_pan = poe->pan;
         }
 
         // fishing: a fish on the line pulls from where it swims, R2 is the line's brake (hooked = a fish
@@ -1583,20 +1967,26 @@ public:
             }
             hooked = hook_t >= 0 && now - hook_t > 250;
             if (hooked && fish) {
-                if (now - hook_t < 350 && next_tug == 0) { // the bite
+                if (now - hook_t < 350 && next_tug == 0 && hx) { // the bite
+                    Play(Fx::Bite, 1, 1, fish->pan);
                     q.Pulse(now, 0, 8, 60, 90);
                     Glow({120, 230, 255}, 200, 0.9f);
                 }
-                if (now >= next_tug) { // it pulls this way and that
+                if (now >= next_tug && hx) { // it pulls this way and that
                     const float drag = std::clamp(fish->pan + static_cast<float>(uniform(rng) - 0.5), -1.0f, 1.0f);
+                    hp.drag_pan = drag;
                     q.Pulse(now, drag < 0 ? 4.0f : 1.0f, drag > 0 ? 4.0f : 1.0f, 45, 140, 0, true, true);
                     next_tug = now + 250 + static_cast<long long>(uniform(rng) * 450);
                 }
+                set_loop(Loop::Drag, 0.4f + 0.6f * (std::max)(0.0f, pull));
                 r = Feedback(1, std::clamp(3 + static_cast<int>(5 * (std::max)(0.0f, pull)), 1, 8));
                 bar = std::clamp(pull, 0.0f, 1.0f);
             }
         }
-        if (!hooked) next_tug = 0;
+        if (!hooked) {
+            next_tug = 0;
+            set_loop(Loop::Drag, 0);
+        }
         if (fishing && flags[H("MiniGame_Fishing_Rainy")]) act.StartRain(now, 1500);
 
         // the Master Sword knocked away (Ganon): R2 goes slack until it is back
@@ -1606,12 +1996,17 @@ public:
                 if (f.name.find("Ganon") != std::string::npos && f.distance < 40) ganon_near = true;
             }
         }
-        if (!last_weapon.empty() && weapon.empty() && ganon_near) {
+        if (!last_weapon.empty() && weapon.empty() && ganon_near && hx) {
+            Play(Fx::SwordLost);
             sword_gone_since = now;
             Glow({60, 60, 80}, 600, 0.6f);
         }
         if (sword_gone_since >= 0) {
             if (!weapon.empty()) {
+                if (hx) {
+                    Play(Fx::EquipSword, 1.2f);
+                    Play(Fx::Detent);
+                }
                 q.Pulse(now, 0, 6, 90, 80);
                 sword_gone_since = -1;
             } else {
@@ -1637,12 +2032,14 @@ public:
                 if (now >= next_guard_beat && !in_event) {
                     const float k = 1 - guard->distance / 14;
                     const auto pl = Quad::Place(guard->pan, guard->front, 0.3f + 0.5f * k);
+                    Play(Fx::Heartbeat, (std::max)(0.3f, pl.palm), 1, pl.pan);
                     q.Pulse(now, pl.l2 * 0.5f, pl.r2 * 0.5f, 30, 70, 0, false, true);
                     next_guard_beat = now + static_cast<long long>(380 + 1000 * (1 - k));
                 }
             }
             const float jump = std::abs(s.x - last_x) + std::abs(s.z - last_z);
             if (jump > 3 && event_start >= 0 && now - event_start < 6000 && event_start - guard_seen < 2500 && now >= caught_until) {
+                Play(Fx::Caught);
                 Glow({255, 0, 0}, 1500, 0.9f, true);
                 mic_until = now + 2000;
                 caught_until = now + 5000;
@@ -1654,6 +2051,21 @@ public:
         }
         last_x = s.x;
         last_z = s.z;
+
+        // bunny hood: springy steps when the mask makes you faster than you usually run
+        const float speed = act.PosSpeed();
+        const long long bunny_last = bunny_t;
+        bunny_t = now;
+        const bool grounded = std::abs(s.vy) < 0.5f && !act.HasVerb("Swim");
+        if (!masked && grounded && speed > 1) run_base = (std::max)(run_base * 0.9995f, speed);
+        if (masked && child && grounded && speed > run_base * 1.12f && hx) {
+            const double before = bunny_ph;
+            bunny_ph += speed * 0.5 * std::clamp((now - bunny_last) / 1000.0, 0.0, 0.1);
+            if (std::floor(bunny_ph) != std::floor(before) && now - bunny_step > 120) {
+                Play(Fx::ChainJump, 0.45f, 2, static_cast<long long>(std::floor(bunny_ph)) % 2 == 0 ? -0.6f : 0.6f);
+                bunny_step = now;
+            }
+        }
     }
 
     std::optional<std::pair<Rgb, float>> Light(long long now) {
@@ -1680,6 +2092,7 @@ private:
         later.emplace_back(now + ms, std::move(run));
     }
     void WaterChange(long long now, bool up) { // the water rises from the palms into the fingers, or drains away
+        Play(Fx::WaterRise, 1, up ? 1 : 2);
         if (up) {
             quad->Pulse(now, 3, 3, 30, 600, 900, false, true);
             quad->Pulse(now, 6, 6, 30, 700, 1600, true, true);
@@ -1706,13 +2119,23 @@ private:
         // time travel in the Temple of Time: white light after a moment of silence
         const bool c = gd.GetBool(H("Sequence_IsChildhood")).value_or(true);
         if (child_known && was_child != c && in_map({"TempleOfTime", "ShrineOfTime", "DoorOfTime"})) {
+            Common::PulseHaptics::Hush(1000);
+            Later(now, 800, [this, now] {
+                Play(Fx::TimeShift);
+                quad->Pulse(now + 800, 5, 5, 30, 1800, 0, true, true);
+            });
             Glow({255, 255, 255}, 3500, 0.95f, false, 800);
-            Later(now, 800, [this, now] { quad->Pulse(now + 800, 5, 5, 30, 1800, 0, true, true); });
         }
         child_known = true;
         was_child = c;
         child = c;
+        // the other body: impacts lighter and quicker as a child, heavier as an adult
+        auto& hp = Common::PulseHaptics::GetParams();
+        hp.body_rate = c ? 1.15f : 0.92f;
+        hp.body_weight = c ? 0.88f : 1.08f;
+        // the dream world: everything a little softer
         dream = in_map({"Dream"});
+        hp.fx_scale = dream ? 0.85f : 1.0f;
 
         // minigames: start shot, timer, score
         const bool flag = gd.GetBool(H("MiniGame_IsTimerCounting")).value_or(false);
@@ -1723,17 +2146,22 @@ private:
         else if (val != timer_val) { timer_val = val; timer_moved = now; }
         const bool on = flag && now - timer_moved < 1500;
         const float left = down ? val : lim > 0 ? lim - val : -1;
-        if (on && !timer_on) { quad->Pulse(now, 0, 8, 50, 90); Glow({255, 255, 255}, 250, 0.9f); score_game_until = now + 120000; }
-        if (!on && timer_on && timer_left >= 0 && timer_left < 0.6f) { mic_until = now + 1500; Glow({255, 40, 0}, 800, 0.8f); }
+        if (on && !timer_on) { Play(Fx::StartShot); quad->Pulse(now, 0, 8, 50, 90); Glow({255, 255, 255}, 250, 0.9f); score_game_until = now + 120000; }
+        if (!on && timer_on && timer_left >= 0 && timer_left < 0.6f) { Play(Fx::TimeUp); mic_until = now + 1500; Glow({255, 40, 0}, 800, 0.8f); }
         timer_on = on;
         timer_left = on ? left : -1;
         timer_frac = on && lim > 0 && left >= 0 ? std::clamp(left / lim, 0.0f, 1.0f) : -1;
         const int score = gd.GetInt(H("MiniGame_Score")).value_or(-1), max = gd.GetInt(H("MiniGame_ScoreMax")).value_or(0);
         if (last_score >= 0 && score > last_score && score - last_score < 1000) {
+            Play(Fx::TargetHit, (std::min)(1.4f, 0.8f + (score - last_score) / 200.0f));
             quad->Pulse(now, 4, 5, 150, 50);
             Glow({255, 220, 60}, 180, 0.7f);
-            if ((last_score < 750 && score >= 750) || (last_score < 1400 && score >= 1400)) Glow({255, 200, 40}, 1500, 0.9f);
+            if ((last_score < 750 && score >= 750) || (last_score < 1400 && score >= 1400)) {
+                Play(Fx::Fanfare);
+                Glow({255, 200, 40}, 1500, 0.9f);
+            }
             score_game_until = now + 60000;
+            shot_at = 0;
         }
         last_score = score;
         if (now < score_game_until && !timer_on && max > 0 && score >= 0) timer_frac = std::clamp(score / static_cast<float>(max), 0.0f, 1.0f);
@@ -1741,7 +2169,12 @@ private:
         // the fishing pond: a new record
         const int fa = gd.GetInt(H("MiniGame_Fishing_RecordFishSize_Adult")).value_or(-1);
         const int fc = gd.GetInt(H("MiniGame_Fishing_RecordFishSize_Child")).value_or(-1);
-        if ((fish_a >= 0 && fa > fish_a) || (fish_c >= 0 && fc > fish_c)) Glow({255, 210, 60}, 2000, 0.9f, false, 900);
+        if ((fish_a >= 0 && fa > fish_a) || (fish_c >= 0 && fc > fish_c)) { // a new record lands with a fanfare, by size
+            const int size = (std::max)(fa, fc);
+            Play(Fx::Catch, 1, size >= 60 ? 3 : size >= 50 ? 2 : 1);
+            Later(now, 900, [size] { Play(Fx::Fanfare, size >= 50 ? 1.3f : 1.0f); });
+            Glow({255, 210, 60}, 2000, 0.9f, false, 900);
+        }
         fish_a = fa;
         fish_c = fc;
 
@@ -1754,38 +2187,82 @@ private:
         }
         // ice melts
         for (const char* n : {"Gimmick_RedIce_Melted", "ForestTemple_Room14_MeltedIce", "ForestTemple_Room27_MeltedIce"}) {
-            if (Rise(H(n), gd.GetBool(H(n)).value_or(false))) Glow({120, 200, 255}, 1200, 0.6f);
+            if (Rise(H(n), gd.GetBool(H(n)).value_or(false))) {
+                Play(Fx::Melt);
+                Glow({120, 200, 255}, 1200, 0.6f);
+            }
         }
         // the castle collapses
         for (const char* n : {"2F_FallDown", "4F_BreakRoom", "AfterStep03", "AfterStep05", "AfterStep08", "AfterStep10",
                               "StartFireTrap_3F", "OpenLastGate", "SetBackRubble"}) {
             const u32 h = H(std::string("EscapeFromCrumblingGanonCastle_") + n);
             if (Rise(h, gd.GetBool(h).value_or(false))) {
+                Play(Fx::Collapse);
                 quad->Pulse(now, 8, 8, 30, 300, 0, true, true);
+                Common::PulseHaptics::Duck(800);
                 Glow({255, 80, 0}, 1500, 0.8f, true);
                 escape_until = now + 90000;
             }
         }
         // Ganon
         const u32 eye = H("Enemy_DungeonBossGanon_IsOpenedThirdEye"), zelda = H("Enemy_DungeonBossGanon_IsZeldaMagicChargeFinish");
-        if (Rise(eye, gd.GetBool(eye).value_or(false))) Glow({255, 215, 90}, 2500, 0.6f);
+        if (Rise(eye, gd.GetBool(eye).value_or(false))) {
+            Play(Fx::Chime, 1.2f);
+            Glow({255, 215, 90}, 2500, 0.6f);
+        }
         if (Rise(zelda, gd.GetBool(zelda).value_or(false))) {
+            Play(Fx::Nayru, 1.3f);
             quad->Pulse(now, 5, 5, 60, 900, 0, false, true);
             Glow({255, 250, 220}, 2000, 0.9f);
         }
         Rise(H("MiniGame_Fishing_Rainy"), gd.GetBool(H("MiniGame_Fishing_Rainy")).value_or(false));
         // cuccos
         const u32 cucco = H("Cucco_IsAngry");
-        if (Rise(cucco, gd.GetBool(cucco).value_or(false))) Glow({255, 255, 255}, 6000, 0.5f, true);
+        if (Rise(cucco, gd.GetBool(cucco).value_or(false))) {
+            Play(Fx::Rage, 1.2f);
+            Glow({255, 255, 255}, 6000, 0.5f, true);
+        }
+        // masks
+        const u32 head_h = H("PlayerStatus.IsActiveHeadArmor");
+        const bool head = gd.GetBool(head_h).value_or(false);
+        const bool head_known = flags.contains(head_h);
+        if (Rise(head_h, head)) Play(Fx::MaskOn);
+        else if (head_known && masked && !head) Play(Fx::MaskOn, 1, 2);
+        masked = head;
+        // bottles: what goes in, what is drunk (1 fairy, 2 bug, 3 fish, 4 poe, 5 blue fire, 6 liquid, 7 letter, 0 empty)
+        const auto content = [](u32 v) {
+            for (const auto& [n, k] : {std::pair{"Empty", 0}, {"Fairy", 1}, {"Bug", 2}, {"Fish", 3}, {"Poe", 4}, {"BigPoe", 4}, {"BlueFire", 5},
+                                       {"RedPotion", 6}, {"GreenPotion", 6}, {"BluePotion", 6}, {"MaxMilk", 6}, {"HalfMilk", 6}, {"Letter", 7}}) {
+                if (Hash(n) == v) return k;
+            }
+            return -1;
+        };
+        for (const char b : std::string_view{"ABCDE"}) {
+            const u32 h = H(std::string("PlayerStatus.AssignableItem.BottleInfo.Bottle") + b + ".BottleItem");
+            const u32 v = gd.GetEnum(h).value_or(0);
+            const auto it = bottles.find(h);
+            if (it != bottles.end() && it->second != v) {
+                const int prev = content(it->second), cur = content(v);
+                if (prev == 0 && cur > 0 && cur < 7) Play(Fx::BottleCatch, 1, cur); // caught something
+                else if (prev == 6 && (cur == 0 || cur == 6)) Play(Fx::Gulp, 1, 3); // drank it (or half the milk)
+                else if (prev >= 2 && prev <= 5 && cur == 0) Play(Fx::Bottle, 0.8f); // let it out (a fairy's heal plays already)
+            }
+            bottles[h] = v;
+        }
 
         // Ingo's race and the Shadow Temple's ship (sequence enums)
         constexpr u32 EponaSeq = 0x4969f026, ShadowSeq = 0x7a91dbd5;
         const u32 race = H("GambleRacePlaying"), complete = H("Complete"), ship = H("BattleOnShip");
         const u32 ep = gd.GetEnum(EponaSeq).value_or(0);
         if (epona_known && epona_seq != ep) {
-            if (ep == race) { quad->Pulse(now, 0, 8, 50, 90); Glow({255, 160, 60}, 1200, 0.6f); }
+            if (ep == race) { Play(Fx::StartShot); quad->Pulse(now, 0, 8, 50, 90); Glow({255, 160, 60}, 1200, 0.6f); }
             if (epona_seq == race && ep == complete) {
-                Later(now, 400, [this, now] { quad->Pulse(now + 400, 8, 8, 35, 250); });
+                Common::PulseHaptics::Hush(500);
+                Later(now, 400, [this, now] {
+                    Play(Fx::Fanfare, 1.3f);
+                    Play(Fx::KillMidBoss, 0.8f);
+                    quad->Pulse(now + 400, 8, 8, 35, 250);
+                });
                 Glow({255, 200, 40}, 2500, 0.9f, false, 400);
             }
         }
@@ -1793,7 +2270,10 @@ private:
         epona_seq = ep;
         racing = ep == race;
         const u32 sh = gd.GetEnum(ShadowSeq).value_or(0);
-        if (shadow_known && shadow_seq == ship && sh == H("BeforeBossRoom")) quad->Pulse(now, 4, 4, 28, 2000, 0, true, true); // the ship sinks
+        if (shadow_known && shadow_seq == ship && sh == H("BeforeBossRoom")) { // the ship sinks
+            Play(Fx::ShipSink);
+            quad->Pulse(now, 4, 4, 28, 2000, 0, true, true);
+        }
         shadow_known = true;
         shadow_seq = sh;
         on_ship = sh == ship && in_map({"Shadow"});
@@ -1814,6 +2294,12 @@ private:
     long long next_debris = 0, hook_t = -1, last_pull = 0, next_tug = 0, next_guard_beat = 0;
     Rgb light{};
     std::string last_weapon;
+    bool hx = true;
+    long long shot_at = 0, next_peck = 0, bunny_t = 0, bunny_step = 0;
+    int score_at_shot = 0;
+    double bunny_ph = 0;
+    float run_base = 4;
+    std::unordered_map<u32, u32> bottles;
     std::mt19937 rng{7};
     std::uniform_real_distribution<double> uniform{0.0, 1.0};
 };
@@ -1830,7 +2316,8 @@ const u32 HRupee = Hash("PlayerStatus.CurrentRupee"), HMp = Hash("PlayerStatus.M
 const u32 HNuts = Hash("PouchData.Item_DekuNut.StockNum"), HBombs = Hash("PouchData.Item_Bomb.StockNum");
 const u32 HWalletM = Hash("PouchData.Item_Wallet_Medium.StockNum"), HWalletL = Hash("PouchData.Item_Wallet_Large.StockNum");
 const u32 HWeapon = Hash("PlayerStatus.EquipWeapon");
-const u32 HChus = Hash("PouchData.Item_Bombchu.StockNum");
+const u32 HChus = Hash("PouchData.Item_Bombchu.StockNum"), HSticks = Hash("PouchData.Item_DekuStick.StockNum");
+const u32 HDeath = Hash("PlayerDeadReason");
 constexpr int BSquare = 1, BCross = 2, BCircle = 4, BL1 = 0x10, BR1 = 0x20;
 // The stick's direction 0 (up) clockwise to 7, -1 near the middle
 int StickDir(int x, int y) {
@@ -1869,6 +2356,16 @@ void Run(Core::System& system, u64 main_base) {
     Moments mom;
     Quad quad;
     int prev_buttons = 0, swing_dir = 1, combo_n = 0, last_ammo = -1, last_chus = -1, prev_dir = -1, prev_l2b = 0, prev_r2b = 0;
+    // (Daemon.cs's haptic state)
+    int last_sticks = -1;
+    bool was_aiming_nock = false, last_child = false;
+    long long next_search_ping = 0, last_heal_fx = 0, last_fill_fx = 0, gallop_spur = 0, next_boss_fx = 0, last_hoof_beat = LLONG_MIN;
+    float prev_speed = 0;
+    double step_ph = 0;
+    auto& hp = Common::PulseHaptics::GetParams();
+    const auto clear_loops = [&] {
+        for (auto& v : hp.loops) v.store(0.0f, std::memory_order_relaxed);
+    };
     int touch_y0 = 0, touch_steps = 0, touch_free_y = 0, shield_charge = 0;
     long long square_down = -1, last_swing = 0, next_beat = 0, aim_end = -1, nav_repeat = 0, next_sonar = 0, heat_since = -1;
     long long next_heat = 0, next_drop = 0, touch_start = -1, touch_free = -1, led_level_until = 0, navi_until = 0;
@@ -1924,12 +2421,19 @@ void Run(Core::System& system, u64 main_base) {
         const bool have_pad = pad.valid.load();
         const float pull = have_pad ? pad.r2.load() / 255.0f : -1.0f;
         const int buttons = have_pad ? pad.buttons.load() : 0;
+        hp.pull = pull;
+        hp.active = true;
         if (!s.in_game || gd.GetBool(HLoading).value_or(false)) {
             last_life = last_rupee = last_mp = last_max_life = last_nuts = last_bombs = last_ammo = last_chus = -1;
             aim_since = -1;
             min_vy = 0;
             charge = 0;
             fuse_until = 0;
+            last_sticks = -1;
+            hp.aiming = false;
+            hp.charge = 0;
+            clear_loops();
+            hp.muffle = false;
             PublishOff();
             continue;
         }
@@ -1950,6 +2454,10 @@ void Run(Core::System& system, u64 main_base) {
                             gd.GetInt(HPauseReq).value_or(0) > 0;
         const bool child = gd.GetBool(HChild).value_or(false);
         const int ammo = (child ? gd.GetInt(HSeeds) : gd.GetInt(HArrows)).value_or(0);
+        if (child != last_child) {
+            last_ammo = -1;
+            last_child = child;
+        }
         const int max_life = gd.GetInt(HMaxLife).value_or(-1);
         if (now >= next_strings) {
             shield = gd.GetStr(HShield).value_or("");
@@ -1957,7 +2465,7 @@ void Run(Core::System& system, u64 main_base) {
             armor = gd.GetStr(HArmor).value_or("");
             map = gd.GetStr(HMap).value_or("");
             weapon = gd.GetStr(HWeapon).value_or("");
-            scene.SetMap(map);
+            scene.SetMap(map, now);
             next_strings = now + 500;
         }
         const bool sword = !weapon.empty();
@@ -1969,18 +2477,35 @@ void Run(Core::System& system, u64 main_base) {
             flash_until = now + ms;
         };
         // how an enemy dies, by its name (Daemon.Family / KillFx): the flashes and the celebration
-        const auto kill_fx = [&](const std::string& name) {
+        const auto kill_fx = [&](const std::string& name, float pan) {
             const auto has = [&](std::initializer_list<std::string_view> k) {
                 for (const auto x : k) {
                     if (ContainsI(name, x)) return true;
                 }
                 return false;
             };
+            // Daemon.Family: how it dies
+            const Fx fx = has({"DungeonBoss"})                                                              ? Fx::KillBoss
+                          : has({"MiddleBoss"})                                                             ? Fx::KillMidBoss
+                          : has({"Skulltula_Gold"})                                                         ? Fx::Token
+                          : has({"Stalfos", "Stalchild"})                                                   ? Fx::KillBones
+                          : has({"IronKnuckle", "Lizalfos", "Dinolfos", "Moblin", "Amos", "Anubis"})        ? Fx::KillArmor
+                          : has({"Poe", "Floormaster", "SkullKid"})                                         ? Fx::KillGhost
+                          : has({"LikeLike", "Bari", "Biri", "Octorok", "ShellBlade", "Freezard", "Shabom"}) ? Fx::KillSquish
+                          : has({"Dekubaba", "Scrub", "Skulltula", "Skullwalltula", "Peahat"})              ? Fx::KillCrunch
+                          : has({"Dodongo", "Leever", "Beamos", "ReDead", "Gibdo", "DeadHand", "Wolfos"})   ? Fx::KillHeavy
+                                                                                                            : Fx::KillPop;
+            Play(fx, 1, 1, pan * 0.6f);
+            Common::PulseHaptics::Duck(fx == Fx::KillBoss || fx == Fx::KillMidBoss ? 1500 : 300);
             const bool boss = has({"DungeonBoss"}), mid = !boss && has({"MiddleBoss"});
             const bool token = !boss && !mid && has({"Skulltula_Gold"});
             const bool ghost = !boss && !mid && !token && !has({"Stalfos", "Stalchild", "IronKnuckle", "Lizalfos", "Dinolfos", "Moblin", "Amos", "Anubis"}) &&
                                has({"Poe", "Floormaster", "SkullKid"});
-            if (name.find("Ganon") != std::string::npos && boss) {
+            if (name.find("Ganon") != std::string::npos && boss) { // the last blow on Ganon, then seven years of light
+                Common::PulseHaptics::Hush(1500);
+                Play(Fx::KillBoss, 1.5f);
+                Play(Fx::TimeShift, 1.2f);
+                quad.Pulse(now, 8, 8, 30, 600, 0, true, true);
                 flash_to(255, 255, 255, 4000);
                 celebrate_until = now + 2500;
             }
@@ -2003,12 +2528,17 @@ void Run(Core::System& system, u64 main_base) {
             // the blade lands where the enemy is: in front the fingertips on that side shake
             const float st = 0.6f + (std::min)(1.0f, h.damage / static_cast<float>((std::max)(1, h.max))) * 0.9f;
             const auto pl = Quad::Place(h.pan, h.front, (std::min)(1.0f, st * 0.8f));
+            Play(Fx::EnemyHit, (std::max)(pl.palm, 0.5f) * st, h.boss ? 2 : 1, pl.pan * 0.85f);
             quad.Pulse(now, (std::max)(pl.l2, 2.0f), (std::max)(pl.r2, 3.0f), h.boss ? 35 : 55, h.boss ? 160 : 90);
-            if (combo_n >= 3) quad.Pulse(now, 6, 6, 40, 120);
             flash_to(255, 245, 220, 110);
+            Common::PulseHaptics::Duck(220);
+            if (combo_n >= 3) {
+                Play(Fx::Finisher, 1, 1, h.pan * 0.6f);
+                quad.Pulse(now, 6, 6, 40, 120);
+            }
             led_chip_until = now + 90; // the target's life bar loses a chip
             if (h.killed) {
-                kill_fx(h.name);
+                kill_fx(h.name, h.pan);
                 recent_kills[h.name] = now;
             }
         }
@@ -2018,6 +2548,7 @@ void Run(Core::System& system, u64 main_base) {
                                 v == "SpecialAttackPrepare" || v == "PreLaunch" || v == "LandCharge" || v == "Inhale";
             const auto apl = Quad::Place(a.pan, a.front, 0.8f);
             if (windup && a.distance < 8 && now >= next_telegraph) {
+                Play(Fx::Telegraph, a.boss ? 1.2f : 0.9f, 1, apl.pan); // air drawn in from its side
                 atk_side = a.pan; // a blow soon after comes from here
                 atk_front = a.front;
                 atk_at = now;
@@ -2026,23 +2557,41 @@ void Run(Core::System& system, u64 main_base) {
                 next_telegraph = now + 350;
                 flash_to(255, 170, 40, 160);
             }
-            else if (v == "Appear" || v == "JumpOut" || v == "Summon" || v == "Transform" || v == "Metamorphose") {
+            else if ((v == "Notice" || v == "Discover" || v == "Surprise" || v == "Provoke" || v == "LookAtTerror") && a.distance < 12) {
+                Play(Fx::Alert, 0.8f, 1, apl.pan);
+            } else if (v == "Appear" || v == "JumpOut" || v == "Summon" || v == "Transform" || v == "Metamorphose") {
+                Play(Fx::Appear, 1, 1, apl.pan);
                 quad.Pulse(now, apl.l2 * 0.6f, apl.r2 * 0.6f, 25, 400, 0, true, true);
+            } else if (v == "InterruptParalyze" || v == "InterruptShock" || v == "InterruptSleepParalysis" || v == "Confuse" || v == "InterruptFrozen") {
+                Play(Fx::Stun, 1, 1, apl.pan);
             } else if ((v.starts_with("InterruptGuard") || v == "Parry") && now - last_swing < 500) {
+                Play(Fx::Blocked, 1, 1, 0.5f);
                 quad.Pulse(now, 0, 8, 80, 90);
+            } else if ((v == "Search" || v == "LookAround" || v == "Observe") && a.distance < 14 && now >= next_search_ping) {
+                Play(Fx::Ping, 0.35f, 1, apl.pan);
+                next_search_ping = now + 1500;
             } else if ((v == "GetAngry" || v == "Uproar" || v == "Shout") && a.distance < 15) {
+                Play(Fx::Rage, 0.6f + 0.4f * (1 - a.distance / 15), 1, apl.pan);
                 quad.Pulse(now, apl.l2 * 0.5f, apl.r2 * 0.5f, 30, 300, 0, true, true);
+            } else if ((v == "Flee" || v == "Cower" || v == "Demoralized") && a.distance < 12) {
+                Play(Fx::Relief, 0.8f, 1, apl.pan);
             }
-            if ((v == "RangedAttack" || v == "RangedLargeAttack") && a.distance < 20) quad.Pulse(now, apl.l2 * 0.7f, apl.r2 * 0.7f, 90, 120, 200);
+            if ((v == "RangedAttack" || v == "RangedLargeAttack") && a.distance < 20) { // a shot whines in from its side
+                Play(Fx::Projectile, v == "RangedLargeAttack" ? 1.2f : 0.8f, 1, apl.pan);
+                quad.Pulse(now, apl.l2 * 0.7f, apl.r2 * 0.7f, 90, 120, 200);
+            }
             if (v == "InterruptBrokenArmor") {
+                Play(Fx::ArmorBreak, 1.2f, 1, apl.pan);
                 quad.Pulse(now, apl.l2, apl.r2, 120, 80);
                 quad.Pulse(now, 5, 5, 60, 120, 120);
                 flash_to(255, 255, 255, 150);
             }
             if (v == "InterruptWeakPointHit") {
+                Play(Fx::WeakSpot, 1.2f, 1, apl.pan);
                 quad.Pulse(now, 6, 6, 120, 80);
                 flash_to(255, 255, 160, 150);
             }
+            if (v == "InterruptAbsorbShoot") Play(Fx::Bite, 0.7f, 1, apl.pan);
             if (v == "InterruptRestraintRideOnPlayer" && a.distance < 3) act.grabbed_until = now + 2500;
             if ((v == "ReleaseRestraint" || v == "Unstick") && a.distance < 3) act.grabbed_until = 0;
         }
@@ -2058,7 +2607,7 @@ void Run(Core::System& system, u64 main_base) {
                 const auto it = kill_state.find(hash);
                 const auto rk = recent_kills.find(n);
                 if (kills_ready && it != kill_state.end() && v > it->second && !(rk != recent_kills.end() && now - rk->second < 1500)) {
-                    kill_fx(n);
+                    kill_fx(n, 0);
                 }
                 kill_state[hash] = v;
             }
@@ -2077,6 +2626,7 @@ void Run(Core::System& system, u64 main_base) {
                                                              !has("Compass") && (has("Medal") || has("Stone"));
                     const bool key = !song && has("SmallKey"), boss_key = !song && has("BossKey");
                     const bool map_item = !song && !boss_key && !key && (has("Map") || has("Compass"));
+                    Play(song ? Fx::SongGet : boss_key ? Fx::BossKeyGet : key ? Fx::KeyGet : map_item ? Fx::MapGet : medal ? Fx::MedalGet : Fx::ItemGet);
                     if (song) flash_to(120, 180, 255, 1300);
                     else if (medal) flash_to(255, 255, 255, 2500);
                     else flash_to(255, 200, 40, 1300);
@@ -2088,6 +2638,7 @@ void Run(Core::System& system, u64 main_base) {
             next_flags = now + 400;
         }
         if (last_max_life > 0 && max_life > last_max_life) {
+            Play(Fx::HeartContainer);
             flash_to(255, 60, 120, 1600); // a heart container
             celebrate_until = now + 1500;
         }
@@ -2096,7 +2647,9 @@ void Run(Core::System& system, u64 main_base) {
         const bool stick_idle = !have_pad || (std::abs(pad.lx.load() - 128) < 24 && std::abs(pad.ly.load() - 128) < 24);
         const auto pressed = [&](int b) { return (buttons & b) != 0 && (prev_buttons & b) == 0; };
         const auto released = [&](int b) { return (buttons & b) == 0 && (prev_buttons & b) != 0; };
-        const auto ao = act.Update(now, s, verbs, names, anim, anim_frame, armor, map, quad, buttons, prev_buttons, stick_idle, paused);
+        const auto ao = act.Update(now, s, verbs, names, anim, anim_frame, armor, map, world, quad, buttons, prev_buttons, stick_idle, paused);
+        hp.material = static_cast<int>(MaterialOf(map, world.indoor, ao.water));
+        hp.loops[static_cast<int>(Loop::Quake)] = 0;
         l_kick = (std::max)(l_kick, act.kick);
         jolt = (std::max)(jolt, act.jolt);
         r_tick = (std::max)(r_tick, act.r_tick);
@@ -2113,10 +2666,25 @@ void Run(Core::System& system, u64 main_base) {
                             !act.HasVerb("UseHookshot") && !act.HasVerb("HookshotShoot");
         if (was_aiming && !aiming) aim_end = now;
         was_aiming = aiming;
+        hp.aiming = aiming && ammo > 0;
+        hp.rubber = child;
+        hp.low_boost = iron ? 1.45f : 1.0f;
+        if (last_ammo >= 0 && ammo < last_ammo && (aiming || now - aim_end < 400)) {
+            Play(child ? Fx::SlingRelease : Fx::BowRelease);
+            mom.Shot(now);
+        } else if (last_ammo >= 0 && ammo > last_ammo) {
+            Play(Fx::AmmoGet);
+        }
         last_ammo = ammo;
-        if (aiming && ammo == 0 && pull > 0.85f && !dry_clicked) dry_clicked = true; // the dry click: R2 jams
+        if (aiming && ammo == 0 && pull > 0.85f && !dry_clicked) { // the dry click: R2 jams
+            Play(Fx::DryFire);
+            dry_clicked = true;
+        }
         if (pull < 0.5f) dry_clicked = false;
+        if (aiming && !was_aiming_nock && ammo > 0) Play(Fx::Nock); // an arrow laid on the string
+        was_aiming_nock = aiming;
         if (aiming && ammo > 0 && pull >= 0.95f && !full_draw) { // full draw: a click point at the end of R2's travel
+            Play(Fx::Detent);
             quad.Pulse(now, 0, 3, 250, 20);
             full_draw = true;
         }
@@ -2131,9 +2699,12 @@ void Run(Core::System& system, u64 main_base) {
                 float cs = combo_n == 1 ? 0.8f : combo_n == 2 ? 0.95f : 1.2f;
                 if (combat.nearest_distance < 3) cs *= 1.15f;
                 if (weapon.find("Giant") != std::string::npos || weapon.find("Biggoron") != std::string::npos) {
+                    Play(Fx::SwingHeavy, cs, swing_dir);
                     quad.Pulse(now, 5, 5, 45, 160, 0, true, true); // a two-handed blade: both triggers carry it
                 } else { // the arc runs across the front, from one fingertip to the other
+                    const float light = weapon.find("Kokiri") != std::string::npos ? 0.85f : 1.0f;
                     const int tf = weapon.find("Kokiri") != std::string::npos ? 110 : 85;
+                    Play(Fx::Swing, cs * light, swing_dir);
                     const float a1 = static_cast<float>(static_cast<int>(3 * cs)), a2 = static_cast<float>(static_cast<int>(4.5f * cs));
                     if (swing_dir == 1) {
                         quad.Pulse(now, a1, 0, tf, 50);
@@ -2142,6 +2713,7 @@ void Run(Core::System& system, u64 main_base) {
                         quad.Pulse(now, 0, a1, tf, 50);
                         quad.Pulse(now, a2, 0, tf, 60, 70);
                     }
+                    if (weapon.find("Master") != std::string::npos) Play(Fx::BladeRing, cs);
                 }
                 swing_dir = 3 - swing_dir;
                 last_swing = now;
@@ -2152,6 +2724,7 @@ void Run(Core::System& system, u64 main_base) {
         }
         if (released(BSquare) || !can_swing) {
             if (charge >= 0.35f && can_swing) { // the spin goes once round the controller
+                Play(Fx::SpinRelease);
                 flash_to(140, 200, 255, 300);
                 quad.Pulse(now, 8, 0, 60, 110);
                 quad.Pulse(now, 0, 8, 60, 110, 120);
@@ -2159,7 +2732,9 @@ void Run(Core::System& system, u64 main_base) {
             charge = 0;
             square_down = -1;
         }
+        hp.charge = charge;
         if (charge >= 1 && !full_charge) { // the spin is ready
+            Play(Fx::Detent);
             quad.Pulse(now, 3, 3, 250, 25);
             flash_to(140, 200, 255, 120);
             full_charge = true;
@@ -2167,21 +2742,35 @@ void Run(Core::System& system, u64 main_base) {
         if (charge < 1) full_charge = false;
 
         // the pause screen: a page you hold
-        if (paused != was_paused) quad.Pulse(now, 2, 2, 60, 50);
+        if (paused != was_paused) {
+            Play(paused ? Fx::MenuOpen : Fx::MenuClose);
+            quad.Pulse(now, 2, 2, 60, 50);
+        }
         was_paused = paused;
         if (paused && have_pad) {
             const int dpad = pad.dpad.load();
             const int dir = dpad < 8 ? dpad : StickDir(pad.lx.load(), pad.ly.load());
             if (dir >= 0 && (dir != prev_dir || now >= nav_repeat)) {
                 const float np = dir == 5 || dir == 6 || dir == 7 ? -0.75f : dir == 1 || dir == 2 || dir == 3 ? 0.75f : 0.0f;
+                Play(Fx::MenuTick, 1, 1, np);
                 quad.Pulse(now, np < 0 ? 2 : 0, np > 0 ? 2 : 0, 120, 25);
                 nav_repeat = now + (dir != prev_dir ? 380 : 130);
             }
             prev_dir = dir;
-            if (pressed(BCircle)) quad.Pulse(now, 3, 3, 80, 40);
+            if (pressed(BCircle)) {
+                Play(Fx::MenuConfirm);
+                quad.Pulse(now, 3, 3, 80, 40);
+            }
+            if (pressed(BCross)) Play(Fx::MenuBack);
             const bool zl = pad.l2.load() > 200, zr = pad.r2.load() > 200;
-            if (pressed(BL1) || (zl && prev_l2b == 0)) quad.Pulse(now, 4, 0, 60, 50);
-            if (pressed(BR1) || (zr && prev_r2b == 0)) quad.Pulse(now, 0, 4, 60, 50);
+            if (pressed(BL1) || (zl && prev_l2b == 0)) {
+                Play(Fx::PageFlip, 1, 1);
+                quad.Pulse(now, 4, 0, 60, 50);
+            }
+            if (pressed(BR1) || (zr && prev_r2b == 0)) {
+                Play(Fx::PageFlip, 1, 2);
+                quad.Pulse(now, 0, 4, 60, 50);
+            }
             prev_l2b = zl ? 1 : 0;
             prev_r2b = zr ? 1 : 0;
         } else {
@@ -2189,12 +2778,26 @@ void Run(Core::System& system, u64 main_base) {
         }
 
         // gear changes: each has its own weight
-        if (!prev_weapon.empty() && weapon != prev_weapon && !weapon.empty()) quad.Pulse(now, 0, 4, 90, 60);
-        if (!prev_shield.empty() && shield != prev_shield && !shield.empty()) quad.Pulse(now, 4, 0, 70, 60);
-        if (prev_boot != boot && prev_armor.size() + prev_boot.size() + prev_weapon.size() > 0 && boot.find("HeavyBoot") != std::string::npos) {
-            quad.Pulse(now, 6, 0, 30, 90);
-            quad.Pulse(now, 0, 6, 30, 90, 180);
+        if (!prev_weapon.empty() && weapon != prev_weapon && !weapon.empty()) {
+            Play(Fx::EquipSword);
+            quad.Pulse(now, 0, 4, 90, 60);
         }
+        if (!prev_shield.empty() && shield != prev_shield && !shield.empty()) {
+            Play(shield.find("Deku") != std::string::npos ? Fx::EquipShieldWood : Fx::EquipShieldMetal);
+            quad.Pulse(now, 4, 0, 70, 60);
+        }
+        if (prev_boot != boot && prev_armor.size() + prev_boot.size() + prev_weapon.size() > 0) {
+            if (boot.find("HeavyBoot") != std::string::npos) {
+                Play(Fx::EquipHeavy);
+                quad.Pulse(now, 6, 0, 30, 90);
+                quad.Pulse(now, 0, 6, 30, 90, 180);
+            } else if (boot.find("HoverBoot") != std::string::npos) {
+                Play(Fx::EquipHover);
+            } else {
+                Play(Fx::EquipCloth);
+            }
+        }
+        if (!prev_armor.empty() && armor != prev_armor) Play(Fx::EquipCloth);
         prev_shield = shield;
         prev_boot = boot;
         prev_armor = armor;
@@ -2204,25 +2807,38 @@ void Run(Core::System& system, u64 main_base) {
         if (last_life >= 0 && s.life < last_life) {
             jolt = now + 200;
             if (s.life <= 0) {
+                const u32 reason = gd.GetEnum(HDeath).value_or(0);
+                Play(reason == Hash("LifeDepleted_Fire") || reason == Hash("LifeDepleted_Lava") ? Fx::DeathFire
+                     : reason == Hash("LifeDepleted_Drown")                                    ? Fx::DeathDrown
+                     : reason == Hash("LifeDepleted_Lightning")                                ? Fx::DeathShock
+                                                                                               : Fx::Death);
                 dead_until = now + 2500;
                 dead_at = now;
             } else { // the blow comes from the enemy that just wound up, else from the nearest one
-                const float st = (0.6f + (last_life - s.life) / 8.0f) * 1.0f;
+                const float st = (0.6f + (last_life - s.life) / 8.0f) * act.hit_scale;
                 const bool from_attacker = now - atk_at < 1500;
+                Common::PulseHaptics::Duck(350);
                 if (from_attacker || combat.nearest_distance < 6) {
                     const auto pl = Quad::Place(from_attacker ? atk_side : combat.nearest_side, from_attacker ? atk_front : combat.nearest_front,
                                                 (std::min)(1.0f, st));
+                    Play(Fx::Hit, (std::max)(pl.palm, 0.6f * st), 1, pl.pan * 0.7f);
                     quad.Pulse(now, (std::max)(pl.l2, 3.0f), (std::max)(pl.r2, 3.0f), 40, 220);
+                } else {
+                    Play(Fx::Hit, st);
                 }
                 flash_to(255, 0, 0, 260);
+                act.hit_scale = 1;
             }
         }
-        if (last_life == 0 && s.life > 0 && dead_at >= 0 && now - dead_at < 15000) {
+        if (last_life == 0 && s.life > 0 && dead_at >= 0 && now - dead_at < 15000) { // a fairy
+            Play(Fx::Revive);
             flash_to(255, 150, 220, 1200);
             dead_until = 0;
             dead_at = -1;
-        } else if (last_life > 0 && s.life > last_life) {
+        } else if (last_life > 0 && s.life > last_life && now - last_heal_fx > 600) { // one heal per refill, not per quarter
+            Play(Fx::Heal);
             flash_to(60, 255, 120, 350);
+            last_heal_fx = now;
         }
         last_life = s.life;
 
@@ -2230,44 +2846,74 @@ void Run(Core::System& system, u64 main_base) {
         const bool fast = act.HasVerb("Ride") && s.SpeedH() > 2.5f;
         ride_since = fast ? (ride_since < 0 ? now : ride_since) : -1;
         const bool riding = ride_since >= 0 && now - ride_since > 300;
+        if (riding && (s.SpeedH() - prev_speed) / dt > 22.0f && now > gallop_spur) {
+            Play(Fx::Spur);
+            gallop_spur = now + 1500;
+        }
+        prev_speed = s.SpeedH();
 
         // rupees: a gold flash, the wallet filling on the LEDs; magic: one drop is a spell, a drain the Lens of Truth
         const int rupee = gd.GetInt(HRupee).value_or(-1), mp = gd.GetInt(HMp).value_or(-1);
         if (last_rupee >= 0 && rupee > last_rupee) {
+            const int d = rupee - last_rupee;
+            Play(Fx::Coin, 1, d >= 50 ? 4 : d >= 20 ? 3 : d >= 5 ? 2 : 1);
             flash_to(255, 170, 0, 220);
             const int cap = gd.GetInt(HWalletL).value_or(0) > 0 ? 500 : gd.GetInt(HWalletM).value_or(0) > 0 ? 200 : 99;
             led_show = std::clamp(rupee / static_cast<float>(cap), 0.05f, 1.0f);
             led_show_until = now + 1400;
+        } else if (last_rupee >= 0 && rupee >= 0 && rupee < last_rupee) {
+            Play(Fx::CoinSpend);
         }
         last_rupee = rupee;
         if (last_mp >= 0 && mp < last_mp) {
             lens_until = now - last_mp_drop < 1500 ? now + 1500 : lens_until;
-            if (now >= lens_until) flash_to(170, 60, 255, 300);
+            if (now >= lens_until) {
+                Play(Fx::MagicUse);
+                flash_to(170, 60, 255, 300);
+            }
             const int mp_max = gd.GetInt(HMpMax).value_or(0);
             if (mp_max > 0) {
                 led_show = std::clamp(mp / static_cast<float>(mp_max), 0.05f, 1.0f);
                 led_show_until = now + 1200;
             }
             last_mp_drop = now;
+        } else if (last_mp >= 0 && mp >= last_mp + 4 && now - last_fill_fx > 600) { // refills tick up step by step
+            Play(Fx::MagicFill);
+            last_fill_fx = now;
         }
         last_mp = mp;
         // items used up: a Deku nut's flash, a bomb's fuse
         const int nuts = gd.GetInt(HNuts).value_or(-1), bombs = gd.GetInt(HBombs).value_or(-1);
         const int chus = gd.GetInt(HChus).value_or(-1);
+        const int sticks = gd.GetInt(HSticks).value_or(-1);
         if (last_nuts >= 0 && nuts < last_nuts) {
+            Play(Fx::NutFlash);
             flash_to(255, 255, 240, 450);
             quad.Pulse(now, 5, 5, 120, 80);
         }
-        if (last_chus >= 0 && chus < last_chus) quad.Pulse(now, 3, 3, 45, 1200, 0, true, true);
+        if (last_chus >= 0 && chus < last_chus) {
+            Play(Fx::ChuRoll);
+            quad.Pulse(now, 3, 3, 45, 1200, 0, true, true);
+        }
+        if (last_sticks >= 0 && sticks < last_sticks) Play(Fx::StickSnap);
         last_chus = chus;
+        last_sticks = sticks;
         if (last_bombs >= 0 && bombs < last_bombs) fuse_until = now + 4500;
         last_nuts = nuts;
         last_bombs = bombs;
+        // (Pulse of Time also ends the fuse when the game's sound booms: its sound layer is not ported)
+        hp.loops[static_cast<int>(Loop::Fuse)] = now < fuse_until ? 1.0f : 0.0f;
         // the day turns
         const int hour = world.seconds >= 0 ? world.seconds / 3600 : -1;
         if (last_hour >= 0 && hour >= 0 && hour != last_hour && !world.indoor) {
-            if (hour == 6) flash_to(255, 150, 80, 2500);
-            if (hour == 18) flash_to(120, 60, 160, 2500);
+            if (hour == 6) {
+                Play(Fx::Sunrise);
+                flash_to(255, 150, 80, 2500);
+            }
+            if (hour == 18) {
+                Play(Fx::Nightfall);
+                flash_to(120, 60, 160, 2500);
+            }
         }
         last_hour = hour;
 
@@ -2277,62 +2923,118 @@ void Run(Core::System& system, u64 main_base) {
             air_min_vy = now;
         } else if (min_vy < -5.0f && std::abs(s.vy) < 0.5f) {
             const float st = std::clamp((-min_vy - 4.0f) / 12.0f, 0.2f, 1.2f);
+            Play(Fx::Land, st * (iron ? 1.4f : 1.0f));
             if (st > 0.5f) jolt = (std::max)(jolt, now + 90);
             min_vy = 0;
         } else if (now - air_min_vy > 1500) {
             min_vy = 0;
         }
+        // places: the ambient touch (Daemon's --ambient default, 0.6)
+        if (!paused) {
+            if (const auto amb = scene.Ambient(now)) Play(amb->first, 0.6f, 1, amb->second);
+        }
         // sonar: an enemy close by but not in front of you pings from where it is, faster as it nears
         if (!paused && !act.busy && combat.nearest_distance < 9 && combat.nearest_front < 0.3f && now >= next_sonar) {
             const auto pl = Quad::Place(combat.nearest_side, combat.nearest_front, 0.5f);
+            Play(Fx::Ping, (std::max)(0.3f, pl.palm), 1, pl.pan);
             quad.Pulse(now, pl.l2 * 0.4f, pl.r2 * 0.4f, 100, 40);
             next_sonar = now + static_cast<long long>(350 + 1050 * std::clamp((combat.nearest_distance - 1.5f) / 7.5f, 0.0f, 1.0f));
         }
         // heat: fire places without the Goron tunic press in slow waves that grow with time
-        const bool hot = (ContainsI(map, "Crater") || ContainsI(map, "FireTemple")) && armor.find("Goron") == std::string::npos;
+        const bool hot = scene.Fire() && (map.find("Crater") != std::string::npos || map.find("FireTemple") != std::string::npos) &&
+                         armor.find("Goron") == std::string::npos;
         heat_since = hot ? (heat_since < 0 ? now : heat_since) : -1;
         const float heat = hot ? (std::min)(1.0f, 0.3f + (now - heat_since) / 60000.0f) : 0.0f;
         if (hot && !paused && now >= next_heat) {
+            Play(Fx::HeatPulse, heat);
             quad.Pulse(now, 2 * heat, 2 * heat, 20, 600, 0, true, true);
             next_heat = now + 2600 - static_cast<long long>(1200 * heat);
         }
-        // rain: drops tap the fingertips
-        if (act.raining && !world.indoor && !paused && now >= next_drop) {
-            const bool left = uniform(rng) < 0.5;
-            quad.Pulse(now, left ? 1.5f : 0.0f, left ? 0.0f : 1.5f, 200, 30);
-            next_drop = now + 200 + static_cast<long long>(uniform(rng) * 500);
+        // rain: drops tap the fingertips too, and running splashes through puddles
+        if (act.raining && !world.indoor && !paused) {
+            if (now >= next_drop) {
+                const bool left = uniform(rng) < 0.5;
+                quad.Pulse(now, left ? 1.5f : 0.0f, left ? 0.0f : 1.5f, 200, 30);
+                next_drop = now + 200 + static_cast<long long>(uniform(rng) * 500);
+            }
+            if (s.SpeedH() > 1 && std::abs(s.vy) < 0.5f && !ao.water) {
+                const double before = step_ph;
+                step_ph += s.SpeedH() * 0.55 * dt;
+                if (std::floor(step_ph) != std::floor(before)) {
+                    Play(Fx::Puddle, 1, 1, static_cast<long long>(std::floor(step_ph)) % 2 == 0 ? -0.6f : 0.6f);
+                }
+            }
         }
         // the world around: treasure glints, danger rolling at you, a lock opened
         if (!paused) {
             const Combat::Seen* treasure = nullptr;
             const Combat::Seen* danger = nullptr;
+            float warm = 0, warm_pan = 0, mist = 0, mist_pan = 0;
             for (const auto& o : combat.objects) {
                 if (o.kind == Combat::Kind::Treasure && o.distance < 9 && (treasure == nullptr || o.distance < treasure->distance)) treasure = &o;
+                if (o.kind == Combat::Kind::Heat && o.distance < 6) {
+                    const float k = (1 - o.distance / 6) * (1 - o.distance / 6);
+                    warm += k;
+                    warm_pan += o.pan * k;
+                }
+                if (o.kind == Combat::Kind::Water && o.distance < 10) {
+                    mist = (std::max)(mist, 1 - o.distance / 10);
+                    mist_pan = o.pan;
+                }
                 if (o.kind == Combat::Kind::Danger && o.distance < 16 && o.closing > 1.5f && (danger == nullptr || o.distance < danger->distance)) danger = &o;
             }
             if (treasure && now >= next_sparkle && !act.in_event) {
                 const auto pl = Quad::Place(treasure->pan, treasure->front, 0.6f);
+                Play(Fx::Sparkle, (std::max)(0.4f, pl.palm), 1, pl.pan);
                 quad.Pulse(now, pl.l2 * 0.3f, pl.r2 * 0.3f, 200, 30);
                 next_sparkle = now + static_cast<long long>(350 + 1300 * std::clamp(treasure->distance / 9, 0.0f, 1.0f));
             }
-            if (danger && danger->distance < 4 && danger->front > 0) {
-                quad.Pulse(now, 5 * (1 - danger->pan) / 2 + 2, 5 * (1 + danger->pan) / 2 + 2, 30, 80, 0, true, true);
+            // fire warms you from its side; a waterfall sprays from its side
+            hp.loops[static_cast<int>(Loop::Warmth)] = (std::min)(1.0f, warm);
+            hp.warm_pan = warm > 0 ? std::clamp(warm_pan / warm, -1.0f, 1.0f) : 0.0f;
+            hp.loops[static_cast<int>(Loop::Mist)] = mist;
+            hp.mist_pan = mist_pan;
+            // something heavy rolling at you: a rumble that swells from its side
+            if (danger) {
+                hp.loops[static_cast<int>(Loop::Danger)] = std::clamp(1.2f - danger->distance / 14, 0.2f, 1.0f);
+                hp.danger_pan = danger->pan;
+                if (danger->distance < 4 && danger->front > 0) {
+                    quad.Pulse(now, 5 * (1 - danger->pan) / 2 + 2, 5 * (1 + danger->pan) / 2 + 2, 30, 80, 0, true, true);
+                }
+            } else {
+                hp.loops[static_cast<int>(Loop::Danger)] = 0;
             }
-            if (combat.gone.size() == 1 && combat.gone[0].kind == Combat::Kind::Lock) quad.Pulse(now, 4, 4, 60, 60, 350);
+            if (combat.gone.size() == 1 && combat.gone[0].kind == Combat::Kind::Lock) {
+                Play(Fx::Unlock);
+                quad.Pulse(now, 4, 4, 60, 60, 350);
+            }
         }
         // iron boots: every step a heavy stamp
-        const bool grounded = std::abs(s.vy) < 0.5f && !act.HasVerb("Swim") && !riding;
+        const bool grounded = std::abs(s.vy) < 0.5f && !ao.water && !riding;
         const float walk = (std::max)(s.SpeedH(), act.PosSpeed());
         if (iron && grounded && walk > 0.4f && !paused && !act.carried) {
             const double before = iron_ph;
             iron_ph += walk * 0.75 * dt;
             if (std::floor(iron_ph) != std::floor(before)) {
                 const bool left_foot = static_cast<long long>(std::floor(iron_ph)) % 2 == 0;
+                Play(Fx::Footstep, 1, 1, left_foot ? -0.55f : 0.55f);
                 quad.Pulse(now, left_foot ? 3 : 1, left_foot ? 1 : 3, 35, 70);
             }
         }
+        // dashing: the air rushes past the hands
+        {
+            auto& wind = hp.loops[static_cast<int>(Loop::Wind)];
+            wind = (std::max)(wind.load(), grounded && walk > 5.5f && !paused ? (std::min)(0.45f, (walk - 5.5f) / 4.0f + 0.2f) : 0.0f);
+        }
         events.Update(now, oot.EventName(), act.in_event, paused, act, quad);
+        if (now < events.hooves_until) {
+            const float k = (now - events.hooves_from) / static_cast<float>((std::max)(1ll, events.hooves_until - events.hooves_from));
+            auto& hooves = hp.loops[static_cast<int>(Loop::Hooves)];
+            hooves = (std::max)(hooves.load(), 0.15f + 0.85f * k * k);
+            hp.hoof_rate = 2.4f;
+        }
         mom.Update(now, gd, act, s, map, &combat, weapon, paused, quad, pull);
+        hp.hoof_pan = have_pad ? -(pad.lx.load() - 128) / 128.0f : 0.0f; // Epona leans out of the turn
 
         // boss signatures: the nearest boss's colour
         std::optional<Rgb> boss_light;
@@ -2341,22 +3043,56 @@ void Run(Core::System& system, u64 main_base) {
             for (const auto& f : combat.live) {
                 if (f.boss && (boss == nullptr || f.distance < boss->distance)) boss = &f;
             }
+            const auto mx = [&](Loop k, float v) {
+                auto& x = hp.loops[static_cast<int>(k)];
+                x = (std::max)(x.load(), v);
+            };
             if (boss) {
                 const std::string& bn = boss->name;
                 const auto has = [&](std::string_view k) { return bn.find(k) != std::string::npos; };
-                for (const auto& a : combat.acts) {
-                    if (!a.boss) continue;
-                    const auto apl = Quad::Place(a.pan, a.front, 0.9f);
-                    if (a.name.find("Volvagia") != std::string::npos && (a.verb == "Appear" || a.verb == "JumpOut")) {
-                        quad.Pulse(now, apl.l2 + 3, apl.r2 + 3, 30, 300, 0, true, true); // it bursts out of the lava
-                    }
+                const auto bpl = Quad::Place(boss->pan, boss->front, 0.6f);
+                if (has("Gohma") && now >= next_boss_fx) { // a giant spider scuttling: bursts of tiny legs from where she is
+                    Play(Fx::AmbSand, 0.9f, 1, bpl.pan);
+                    next_boss_fx = now + 1400;
                 }
+                if (has("Barinade")) mx(Loop::Shock, boss->distance < 7 ? 0.18f : 0.06f);
+                if (has("Morpha")) {
+                    mx(Loop::Mist, 0.5f);
+                    hp.mist_pan = boss->pan;
+                }
+                if (has("Ganon") && !has("Phantom") && !has("Ganondorf")) mx(Loop::Quake, 0.15f); // the tower falls apart around you
+                // (Bongo Bongo's drums through the fingers follow the game's sound: not ported)
+            }
+            for (const auto& a : combat.acts) {
+                if (!a.boss) continue;
+                const auto apl = Quad::Place(a.pan, a.front, 0.9f);
+                const bool volvagia = a.name.find("Volvagia") != std::string::npos;
+                if (volvagia && (a.verb == "Hide" || a.verb == "Dive" || a.verb == "QuickDive" || a.verb == "Vanish")) volvagia_under = true;
+                if (volvagia && (a.verb == "Appear" || a.verb == "JumpOut")) { // it bursts out of the lava
+                    volvagia_under = false;
+                    Play(Fx::DinFire, 1.2f);
+                    quad.Pulse(now, apl.l2 + 3, apl.r2 + 3, 30, 300, 0, true, true);
+                    Common::PulseHaptics::Duck(600);
+                }
+            }
+            // Volvagia under the ground: a rumble that wanders under you
+            if (volvagia_under && boss && boss->name.find("Volvagia") != std::string::npos) {
+                mx(Loop::Danger, 0.7f);
+                hp.danger_pan = boss->pan;
+            } else if (!boss) {
+                volvagia_under = false;
+            }
+            if (boss) {
+                const std::string& bn = boss->name;
+                const auto has = [&](std::string_view k) { return bn.find(k) != std::string::npos; };
                 if ((has("Twinrova") || has("Kotake") || has("Koume")) && act.HasVerb("InterruptGuard") && now - last_shield_charge > 600) {
                     shield_charge++; // every block with the Mirror Shield charges it; the third releases the blast
                     last_shield_charge = now;
                     led_show = (std::min)(1.0f, shield_charge / 3.0f);
                     led_show_until = now + 2500;
                     if (shield_charge >= 3) {
+                        Play(Fx::Perfect, 1.3f);
+                        Play(Fx::DinFire);
                         quad.Pulse(now, 8, 8, 40, 400);
                         shield_charge = 0;
                     }
@@ -2369,8 +3105,18 @@ void Run(Core::System& system, u64 main_base) {
                                              : Rgb{200, 0, 30};
             }
         }
+        if (riding) {
+            const double hph = hp.hoof_phase.load();
+            const long long beat = static_cast<long long>(std::floor(hph));
+            if (beat != last_hoof_beat && hph - beat > 0.18) {
+                quad.Pulse(now, 7, 0, 40, 60);
+                quad.Pulse(now, 0, 8, 40, 70, static_cast<int>(0.18 / hp.hoof_rate.load() * 1000));
+                last_hoof_beat = beat;
+            }
+        }
         const bool low = s.life > 0 && s.life * 4 <= s.life_max;
         const bool critical = s.life > 0 && s.life <= 4;
+        if (paused) clear_loops();
 
 
         // ---- triggers ----
@@ -2412,6 +3158,7 @@ void Run(Core::System& system, u64 main_base) {
                 const long long period = critical ? 650 : 1000;
                 const long long ph = now % period;
                 if (now >= next_beat) {
+                    Play(Fx::Heartbeat, critical ? 1.1f : 0.8f);
                     if (!ao.free_triggers) {
                         quad.Pulse(now, critical ? 8 : 5, critical ? 8 : 5, 30, 75, 0, false, true);
                         quad.Pulse(now, critical ? 5 : 3, critical ? 5 : 3, 30, 65, 170, false, true);
@@ -2452,10 +3199,12 @@ void Run(Core::System& system, u64 main_base) {
                 if (goal || foe) {
                     const float side = goal ? goal->pan : foe->pan, front = goal ? goal->front : foe->front;
                     const auto pl = Quad::Place(side, front, 0.8f);
+                    Play(Fx::Compass, (std::max)(0.5f, pl.palm), 1, pl.pan);
                     quad.Pulse(now, pl.l2 * 0.6f, pl.r2 * 0.6f, 150, 60, 0);
                     quad.Pulse(now, pl.l2 * 0.6f, pl.r2 * 0.6f, 150, 60, 220);
                     navi_color = goal ? Rgb{60, 255, 90} : Rgb{255, 220, 40};
                 } else {
+                    Play(Fx::Compass, 0.35f);
                     navi_color = Rgb{80, 140, 255};
                 }
                 navi_until = now + 900;
@@ -2480,6 +3229,7 @@ void Run(Core::System& system, u64 main_base) {
                 if (steps != touch_steps) {
                     const bool trig = touch_key != "master";
                     tune = std::clamp(std::round((tune + 0.1f * (steps - touch_steps)) * 10) / 10, trig ? 0.0f : 0.2f, trig ? 1.5f : 2.0f);
+                    Play(Fx::ProfileTick, 1, std::clamp(static_cast<int>(tune * (trig ? 3.4f : 2.5f)), 1, 5));
                     touch_steps = steps;
                     touch_moved = true;
                     led_level_until = now + 1500;
@@ -2488,6 +3238,7 @@ void Run(Core::System& system, u64 main_base) {
             if (!click && touch_start >= 0) {
                 if (!touch_moved && now - touch_start < 600) {
                     tune_master = tune_master < 0.8f ? 1.0f : tune_master < 1.25f ? 1.5f : 0.6f;
+                    Play(Fx::ProfileTick, 1, tune_master < 0.8f ? 1 : tune_master < 1.25f ? 3 : 5);
                     touch_key = "master";
                     led_level_until = now + 1500;
                 }
@@ -2614,6 +3365,7 @@ void Start(Core::System& system, u64 main_base) {
 void Stop() {
     std::scoped_lock lock{g_mutex};
     g_stop = true;
+    Common::PulseHaptics::GetParams().active = false;
     if (g_thread.joinable()) {
         g_thread.join();
     }
