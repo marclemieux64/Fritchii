@@ -3,10 +3,11 @@
 
 // A port of Pulse of Time's controller output (github.com/Balemuni/pulse-of-time, GPL-3.0-or-later, commit
 // 6d2cf17): Oot.cs (the game's state), GameData.cs (save fields), Actions.cs (Link's action verbs) and the
-// trigger and light parts of Daemon.cs, with their numbers. Not ported yet: Combat.cs (enemies, bosses, the
-// shield's brace), Scene.cs, Events.cs and Moments.cs (places, flashes, scripted moments), Quad.cs pulses and
-// what needs the pad's own input (R2's pull, buttons: the bow's draw on the LEDs, dry fire, the spin
-// charge, ocarina notes, struggling), and the haptic textures (Fritchii plays the game's own HD rumble).
+// trigger and light parts of Daemon.cs, with their numbers; Combat.cs (enemies, bosses, the shield's brace),
+// Scene.cs and Events.cs (places, songs, warps), and the trigger, light, LED and mute LED parts of Moments.cs.
+// Not ported yet: Quad.cs pulses and what needs the pad's own input (R2's pull, buttons: the bow's draw on the
+// LEDs, dry fire, the spin charge, ocarina notes, struggling, a hooked fish), and the haptic textures
+// (Fritchii plays the game's own HD rumble).
 
 #include "core/oot_dualsense.h"
 
@@ -18,6 +19,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <numbers>
 #include <optional>
@@ -307,6 +310,21 @@ struct Oot {
         mem.Read(cmd + 0x10C, &frame, 4);
         return true;
     }
+    // The running event's flowchart name ([[main+0x4E94840]+0x338]), "" = none
+    std::string EventName() const {
+        const u64 mgr = mem.P(mem.main + 0x4E94840);
+        const u64 p = mgr ? mem.P(mgr + 0x338) : 0;
+        if (!p) {
+            return {};
+        }
+        std::string n = mem.Str(p);
+        for (const char ch : n) {
+            if (ch < 0x20 || ch >= 0x7F) {
+                return {};
+            }
+        }
+        return n;
+    }
     World ReadWorld() const {
         World w;
         const u64 comps = link ? mem.P(link + 0x270) : 0;
@@ -370,6 +388,23 @@ public:
             return std::nullopt;
         }
         return static_cast<int>(mem.U32(a));
+    }
+    std::optional<u32> GetEnum(u32 h) {
+        const u64 a = Addr(Enum, h);
+        if (!a) {
+            return std::nullopt;
+        }
+        return mem.U32(a);
+    }
+    std::optional<float> GetFloat(u32 h) {
+        const u64 a = Addr(Float, h);
+        if (!a) {
+            return std::nullopt;
+        }
+        const u32 v = mem.U32(a);
+        float f;
+        std::memcpy(&f, &v, 4);
+        return f;
     }
     std::optional<bool> GetBool(u32 h) {
         const u64 a = Addr(Bool, h);
@@ -556,6 +591,9 @@ public:
 
     bool HasVerb(const std::string& v) const {
         return now_set.contains(v);
+    }
+    void StartRain(long long now, int ms) {
+        rain_until = now + ms;
     }
 
     Out Update(long long now, const State& s, const std::array<int, 5>& verbs,
@@ -892,6 +930,612 @@ private:
     bool climb_moving = false, flying_state = false, was_grabbed = false, was_terror = false;
 };
 
+// ---------- Combat.cs: enemies near Link and the damage they take ----------
+// Actor manager [main+0x4E90D90]: red-black tree at +0x38 (left +0, right +8), entry = node - 8: +0x28 actor,
+// +0x38 next entry with the same key. Actor: name char* +0x20, state u32 +0x2C (4-5 running), position +0x31C,
+// life [[[actor+0x270]+0x2B8]+0x1C10]+8 (max +0x1C18). The walk runs every 350 ms; life every frame.
+class Combat {
+public:
+    enum class Kind { None, Treasure, Heat, Water, Danger, Wind, Lock, Fish, Guard };
+    struct Foe {
+        std::string name;
+        int life{}, max{};
+        float pan{}, front{}, distance{};
+        bool boss{};
+    };
+    struct Act {
+        std::string name, verb;
+        float pan{}, front{}, distance{};
+        bool boss{};
+    };
+    struct Hit {
+        std::string name;
+        int damage{}, max{};
+        bool killed{};
+        float pan{}, front{}, distance{};
+        bool boss{};
+    };
+    struct Seen {
+        Kind kind{};
+        std::string name;
+        float pan{}, front{}, distance{};
+    };
+
+    std::vector<Foe> live;
+    std::vector<Act> acts;
+    std::vector<Seen> objects;
+    int nearby = 0;
+    float nearest_distance = 999;
+    bool boss_near = false;
+
+    static Kind KindOf(const std::string& n) {
+        const auto has = [&](std::initializer_list<std::string_view> k) {
+            for (const auto x : k) {
+                if (ContainsI(n, x)) return true;
+            }
+            return false;
+        };
+        if (has({"Gerudo"}) && (n.starts_with("Npc_") || n.starts_with("Enemy_")) && !has({"MiddleBoss", "Shop"})) return Kind::Guard;
+        if (has({"Fish"}) && !has({"Fishing", "Rod", "Lure", "Bottle", "BGM_"})) return Kind::Fish;
+        if (n.starts_with("BGM_") || n.starts_with("Npc_") || n.starts_with("EftLoc_CameraEnv") || n.starts_with("Shop_")) return Kind::None;
+        if (has({"ChainLock", "KeyLock", "LockedDoor", "Door_Lock"})) return Kind::Lock;
+        if (has({"Heart_Piece", "HeartPiece", "HeartContainer", "Obj_Rupee", "Rupee_Gold", "Rupee_Silver"})) return Kind::Treasure;
+        if (has({"RollingRock", "Boulder", "Spike", "Blade", "Guillotine", "IronBall", "Trap"})) return Kind::Danger;
+        if (has({"Fire", "Torch", "Flame", "Lava", "Brazier", "Bonfire", "Magma", "Burner", "Candle"})) return Kind::Heat;
+        if (has({"Waterfall", "Geyser", "WaterSpout"})) return Kind::Water;
+        if (has({"Fan", "Windmill", "Tornado", "Whirlwind"})) return Kind::Wind;
+        return Kind::None;
+    }
+
+    // The enemies and objects near Link (every 350 ms)
+    void Discover(const Mem& m, u64 link, long long now) {
+        if (now < next_walk) return;
+        next_walk = now + 350;
+        const auto pos = [&](u64 a, float& x, float& y, float& z) {
+            float p[3]{};
+            m.Read(a + 0x31C, p, 12);
+            x = p[0]; y = p[1]; z = p[2];
+        };
+        float lx = 0, ly = 0, lz = 0;
+        if (link) pos(link, lx, ly, lz);
+        const auto P = [&](u64 va) { return va == 0 || (va & 7) != 0 ? 0ull : m.P(va); };
+        const auto in_main = [&](u64 p) { return p >= m.main && p < m.main + 0x5000000; };
+        std::vector<Enemy> list;
+        std::vector<Obj> objs;
+        const u64 mgr = P(m.main + 0x4E90D90), root = mgr ? P(mgr + 0x38) : 0;
+        std::vector<u64> stack;
+        u64 node = root;
+        int visits = 0;
+        while ((node != 0 || !stack.empty()) && visits < 6000) {
+            while (node != 0 && stack.size() < 64) {
+                stack.push_back(node);
+                node = P(node);
+            }
+            if (node != 0) break; // deeper than a balanced tree: changed under us
+            node = stack.back();
+            stack.pop_back();
+            u8 entry[0x40];
+            for (u64 e = node - 8; e != 0 && visits < 6000;) {
+                visits++;
+                if ((e & 7) != 0 || !m.Read(e, entry, 0x40)) break;
+                u64 next, actor;
+                std::memcpy(&next, entry + 0x38, 8);
+                std::memcpy(&actor, entry + 0x28, 8);
+                u8 head[0x10];
+                if (actor == 0 || actor == link || !m.Read(actor + 0x20, head, 0x10)) {
+                    e = next;
+                    continue;
+                }
+                u32 state;
+                u64 name_ptr;
+                std::memcpy(&state, head + 0xC, 4);
+                std::memcpy(&name_ptr, head, 8);
+                if (state < 4 || state > 5 || name_ptr == 0) {
+                    e = next;
+                    continue;
+                }
+                const std::string s = m.Str(name_ptr, 48);
+                float x, y, z;
+                pos(actor, x, y, z);
+                const float dx = x - lx, dy = y - ly, dz = z - lz, d2 = dx * dx + dy * dy + dz * dz;
+                if (!s.starts_with("Enemy_")) {
+                    const Kind k = KindOf(s);
+                    if (k != Kind::None && (link == 0 || d2 < 20.0f * 20.0f) && objs.size() < 48) objs.push_back({actor, s, k});
+                    e = next;
+                    continue;
+                }
+                if (s.find("Skulltula_Gold") != std::string::npos && (link == 0 || d2 < 400) && objs.size() < 48) {
+                    objs.push_back({actor, s, Kind::Treasure});
+                } else if ((KindOf(s) == Kind::Guard || KindOf(s) == Kind::Fish) && (link == 0 || d2 < 400) && objs.size() < 48) {
+                    objs.push_back({actor, s, KindOf(s)});
+                }
+                if (link != 0 && d2 > 25.0f * 25.0f) {
+                    e = next;
+                    continue;
+                }
+                const u64 comp = P(P(actor + 0x270) + 0x2B8);
+                const u64 cur = comp ? P(comp + 0x1C10) : 0, max = comp ? P(comp + 0x1C18) : 0;
+                if (cur && max && in_main(P(cur)) && in_main(P(max))) list.push_back({actor, cur, max, s});
+                e = next;
+            }
+            node = P(node + 8);
+        }
+        found = std::move(list);
+        obj_found = std::move(objs);
+    }
+
+    // The life of the enemies found so far; the hits since the last call
+    std::vector<Hit> Poll(const Mem& m, u64 link, const std::vector<std::string>& names) {
+        std::vector<Hit> hits;
+        acts.clear();
+        live.clear();
+        objects.clear();
+        float lx = 0, lz = 0;
+        if (link) {
+            float p[3]{};
+            m.Read(link + 0x31C, p, 12);
+            lx = p[0];
+            lz = p[2];
+        }
+        // camera right and forward on the ground plane (gameplay camera eye +0x38, look-at +0x44)
+        float rx = 1, rz = 0, ux = 0, uz = 1;
+        const u64 cam = m.P(m.P(m.main + 0x4E98068) + 0x68);
+        float b[6]{};
+        if (cam && m.Read(cam + 0x38, b, 24)) {
+            float fx = b[3] - b[0], fz = b[5] - b[2];
+            const float len = std::sqrt(fx * fx + fz * fz);
+            if (len > 1e-3f) {
+                fx /= len;
+                fz /= len;
+                rx = -fz;
+                rz = fx;
+                ux = fx;
+                uz = fz;
+            }
+        }
+        int near_count = 0;
+        float nearest = 999;
+        bool boss = false;
+        std::unordered_set<u64> seen;
+        for (const auto& f : found) {
+            seen.insert(f.actor);
+            Enemy& e = tracked.try_emplace(f.actor, f).first->second;
+            s32 life = 0, max = 0;
+            if (!m.Read(e.life_ptr + 8, &life, 4) || !m.Read(e.max_ptr + 8, &max, 4) || max <= 0) continue;
+            float p[3]{};
+            m.Read(e.actor + 0x31C, p, 12);
+            const float dx = p[0] - lx, dz = p[2] - lz, dist = std::sqrt(dx * dx + dz * dz);
+            const float pan = dist > 0.3f ? std::clamp((dx * rx + dz * rz) / dist, -1.0f, 1.0f) : 0.0f;
+            const float front = dist > 0.3f ? std::clamp((dx * ux + dz * uz) / dist, -1.0f, 1.0f) : 1.0f;
+            near_count++;
+            if (dist < nearest) nearest = dist;
+            const bool is_boss = e.name.find("Boss") != std::string::npos;
+            boss |= is_boss;
+            if (e.life >= 0 && life < e.life) hits.push_back({e.name, e.life - life, max, life <= 0, pan, front, dist, is_boss});
+            if (dist < 14) {
+                const int v = VerbOf(m, e.actor);
+                if (v != e.verb && e.verb != -1 && v >= 0 && static_cast<size_t>(v) < names.size()) {
+                    acts.push_back({e.name, names[static_cast<size_t>(v)], pan, front, dist, is_boss});
+                }
+                e.verb = v;
+            }
+            e.life = life;
+            e.max = max;
+            if (life > 0) live.push_back({e.name, life, max, pan, front, dist, is_boss});
+        }
+        std::erase_if(tracked, [&](const auto& kv) { return !seen.contains(kv.first); });
+        nearby = near_count;
+        nearest_distance = nearest;
+        boss_near = boss;
+        for (const auto& o : obj_found) {
+            float p[3]{};
+            m.Read(o.actor + 0x31C, p, 12);
+            const float dx = p[0] - lx, dz = p[2] - lz, h = std::sqrt(dx * dx + dz * dz);
+            const float pan = h > 0.3f ? std::clamp((dx * rx + dz * rz) / h, -1.0f, 1.0f) : 0.0f;
+            const float front = h > 0.3f ? std::clamp((dx * ux + dz * uz) / h, -1.0f, 1.0f) : 1.0f;
+            objects.push_back({o.kind, o.name, pan, front, h});
+        }
+        return hits;
+    }
+
+private:
+    struct Enemy {
+        u64 actor{}, life_ptr{}, max_ptr{};
+        std::string name;
+        int life = -1, max = 0, verb = -1;
+    };
+    struct Obj {
+        u64 actor{};
+        std::string name;
+        Kind kind{};
+    };
+    static int VerbOf(const Mem& m, u64 actor) {
+        const u64 bsa = m.P(m.P(actor + 0x270) + 0x188);
+        const u64 slot = bsa ? m.P(bsa + 0x1C0) : 0;
+        s32 v = -1;
+        if (!slot || !m.Read(slot + 0x28, &v, 4)) return -1;
+        if (v == 0x11A && !m.Read(slot + 0x4C, &v, 4)) return -1;
+        return v;
+    }
+    std::vector<Enemy> found;
+    std::vector<Obj> obj_found;
+    std::unordered_map<u64, Enemy> tracked;
+    long long next_walk = 0;
+};
+
+// ---------- Scene.cs: the place's lightbar mood ----------
+class Scene {
+public:
+    enum class Theme { None, Fire, Water, Organic, Forest, Shadow, Desert, Ice, Ganon, Holy, Dream };
+    void SetMap(const std::string& map) {
+        if (map == current_map) return;
+        current_map = map;
+        theme = Classify(map);
+    }
+    std::optional<Rgb> Light(long long now) {
+        const double t = now / 1000.0;
+        switch (theme) {
+        case Theme::Fire:
+            flicker = std::clamp(flicker + static_cast<float>(uniform(rng) - 0.5) * 0.25f, 0.55f, 1.0f);
+            return Rgb{255 * flicker, 85 * flicker, 8 * flicker};
+        case Theme::Water: {
+            const float w = 0.65f + 0.35f * static_cast<float>(std::sin(2 * Pi * 0.4 * t));
+            return Rgb{10 * w, (80 + 60 * w) * w, 255 * w};
+        }
+        case Theme::Organic: {
+            const float p = 0.45f + 0.55f * static_cast<float>(std::pow((std::max)(0.0, std::sin(2 * Pi * t / 1.6)), 4));
+            return Rgb{210 * p, 40 * p, 70 * p};
+        }
+        case Theme::Forest: {
+            if (now > sparkle_until && uniform(rng) < 0.003) sparkle_until = now + 90; // a firefly
+            if (now < sparkle_until) return Rgb{200, 255, 80};
+            const float b = 0.7f + 0.3f * static_cast<float>(std::sin(2 * Pi * 0.25 * t));
+            return Rgb{20 * b, 200 * b, 60 * b};
+        }
+        case Theme::Shadow: {
+            const float b = 0.35f + 0.15f * static_cast<float>(std::sin(2 * Pi * 0.17 * t)) + 0.05f * static_cast<float>(uniform(rng));
+            return Rgb{90 * b, 0, 150 * b};
+        }
+        case Theme::Desert: {
+            const float b = 0.8f + 0.2f * static_cast<float>(std::sin(2 * Pi * 1.3 * t)) * static_cast<float>(std::sin(2 * Pi * 0.21 * t));
+            return Rgb{235 * b, 160 * b, 40 * b};
+        }
+        case Theme::Ice:
+            if (now > sparkle_until && uniform(rng) < 0.006) sparkle_until = now + 60;
+            return now < sparkle_until ? Rgb{255, 255, 255} : Rgb{110, 210, 255};
+        case Theme::Ganon: {
+            const float p = 0.4f + 0.6f * static_cast<float>(std::pow(0.5 + 0.5 * std::sin(2 * Pi * 0.3 * t), 3));
+            return Rgb{160 * p, 0, 12 * p};
+        }
+        case Theme::Holy:
+            return Rgb{255, 225, 160};
+        case Theme::Dream: {
+            const double h = std::fmod(t * 0.05, 1.0);
+            return Rgb{150 + 80 * static_cast<float>(std::sin(2 * Pi * h)), 50, 255};
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+private:
+    static Theme Classify(const std::string& m) {
+        const auto has = [&](std::initializer_list<std::string_view> k) {
+            for (const auto x : k) {
+                if (ContainsI(m, x)) return true;
+            }
+            return false;
+        };
+        if (has({"Dream"})) return Theme::Dream;
+        if (has({"Ganon", "FinalBattle"})) return Theme::Ganon;
+        if (has({"FireTemple", "DeathMountainCrater", "Crater", "DodongoCavern", "Volvagia"})) return Theme::Fire;
+        if (has({"JabuJabu"})) return Theme::Organic;
+        if (has({"IceCavern", "Ice"})) return Theme::Ice;
+        if (has({"WaterTemple", "Zora", "LakeHylia", "Lake"})) return Theme::Water;
+        if (has({"ShadowTemple", "BottomOfTheWell", "Well", "Graveyard"})) return Theme::Shadow;
+        if (has({"SpiritTemple", "Colossus", "Wasteland", "Gerudo", "Desert"})) return Theme::Desert;
+        if (has({"ForestTemple", "LostWood", "Kokiri", "SacredForest", "DekuTree", "Forest"})) return Theme::Forest;
+        if (has({"TempleOfTime", "ShrineOfTime", "DoorOfTime"})) return Theme::Holy;
+        return Theme::None;
+    }
+    std::string current_map;
+    Theme theme = Theme::None;
+    std::mt19937 rng{7};
+    std::uniform_real_distribution<double> uniform{0.0, 1.0};
+    long long sparkle_until = 0;
+    float flicker = 1;
+};
+
+// ---------- Events.cs: scripted moments by the running event's name ----------
+class Events {
+public:
+    void Update(long long now, const std::string& name, bool in_event, bool paused, Actions& act) {
+        if (!initialized) {
+            initialized = true;
+            last = name;
+            was_event = in_event;
+            return;
+        }
+        const bool started = !name.empty() && (name != last || (in_event && !was_event));
+        was_event = in_event;
+        last = name;
+        if (!started) return;
+        if (const auto it = fired.find(name); it != fired.end() && now - it->second < 4000) return;
+        fired[name] = now;
+        if (paused) return; // (Pulse of Time passes no haptics while paused, and so plays nothing)
+        const auto has = [&](std::initializer_list<std::string_view> k) {
+            for (const auto x : k) {
+                if (ContainsI(name, x)) return true;
+            }
+            return false;
+        };
+        const auto glow = [&](float r, float g, float b, int ms) {
+            light = {r, g, b};
+            light_from = now;
+            light_until = now + ms;
+            sweep_day = false;
+        };
+        if (has({"Ocarina", "Melody", "Warp"})) {
+            if (has({"SunSong", "Sun"})) { sweep_day = true; light_from = now; light_until = now + 3500; return; }
+            if (has({"Storm"})) { act.StartRain(now, 90000); glow(200, 210, 255, 400); return; }
+            if (has({"Epona"})) { glow(255, 170, 90, 4500); return; }
+            if (has({"Saria"})) { glow(60, 255, 90, 2500); return; }
+            if (has({"Zelda", "Lullaby"})) { glow(255, 215, 90, 3000); return; }
+            if (has({"SongOfTime", "TimeSong", "Time"})) { glow(170, 210, 255, 3000); return; }
+            if (has({"Minuet", "Forest"})) { glow(40, 255, 70, 3000); return; }
+            if (has({"Bolero", "Fire"})) { glow(255, 70, 0, 3000); return; }
+            if (has({"Serenade", "Water"})) { glow(40, 120, 255, 3000); return; }
+            if (has({"Nocturne", "Shadow"})) { glow(110, 20, 170, 3000); return; }
+            if (has({"Requiem", "Spirit"})) { glow(255, 150, 40, 3000); return; }
+            if (has({"Prelude", "Light"})) { glow(255, 250, 200, 3000); return; }
+            if (has({"Scarecrow"})) return;
+            if (has({"Warp"})) { glow(120, 200, 255, 2500); return; }
+            return;
+        }
+        if (has({"Boss"}) && has({"Appear", "Demo", "Start", "Encount", "Opening"})) { glow(200, 0, 20, 3000); return; }
+        if (has({"SageOf", "Sage_"})) { glow(255, 255, 255, 3000); return; }
+        if (has({"GameOver"})) { glow(60, 0, 0, 3000); return; }
+        if (has({"FallDown"})) { glow(0, 0, 0, 1500); return; }
+        if (has({"BancChange"})) { glow(0, 0, 0, 700); return; }
+        if (has({"Defeat_"})) { glow(255, 220, 120, 3000); return; }
+    }
+    std::optional<Rgb> LightNow(long long now) const {
+        if (now >= light_until) return std::nullopt;
+        if (sweep_day) {
+            const float p = (now - light_from) / static_cast<float>((std::max)(1ll, light_until - light_from));
+            return p < 0.33f ? Rgb{30, 40, 140} : p < 0.66f ? Rgb{255, 120, 60} : Rgb{255, 245, 210};
+        }
+        return light;
+    }
+
+private:
+    bool initialized = false, was_event = false, sweep_day = false;
+    std::string last;
+    std::unordered_map<std::string, long long> fired;
+    Rgb light{};
+    long long light_from = 0, light_until = 0;
+};
+
+// ---------- Moments.cs: story, minigames and places (the parts that reach triggers, light, LEDs, mute LED) ----------
+class Moments {
+public:
+    std::optional<Effect> r, l; // trigger overrides this frame
+    float bar = -1;             // player-LED bar (0..1), -1 = none
+    u8 mic = 0;
+    bool child{}, dream{}, escaping{}, racing{}, on_ship{};
+
+    void Update(long long now, GameData& gd, const Actions& act, const State& s, const std::string& map,
+                const Combat* cb, const std::string& weapon, bool paused) {
+        now_ms = now;
+        r.reset();
+        l.reset();
+        bar = -1;
+        mic = now < mic_until ? 2 : 0;
+        for (size_t i = later.size(); i-- > 0;) {
+            if (now >= later[i].first) {
+                auto run = later[i].second;
+                later.erase(later.begin() + static_cast<std::ptrdiff_t>(i));
+                run();
+            }
+        }
+        const auto in_map = [&](std::initializer_list<std::string_view> k) {
+            for (const auto x : k) {
+                if (ContainsI(map, x)) return true;
+            }
+            return false;
+        };
+        if (now >= next_poll && !paused) {
+            next_poll = now + 100;
+            Poll(now, gd, map);
+        }
+        // the minigame timer (and a score game without a clock: the score) on the LEDs
+        if (timer_on && timer_left >= 0 && !paused) {
+            if (timer_frac >= 0) bar = timer_frac;
+        }
+        if (!timer_on && now < score_game_until && timer_frac >= 0) bar = timer_frac;
+
+        // the collapsing castle: the mute LED stays on
+        escaping = now < escape_until && in_map({"Ganon"});
+        if (escaping && !paused) mic = (std::max)(mic, static_cast<u8>(1));
+
+        // a ship rocks: the weight shifts from one trigger to the other (not while fighting)
+        if (on_ship && !paused && (cb == nullptr || cb->nearest_distance > 8)) {
+            const float a = static_cast<float>(std::sin(2 * Pi * 0.22 * now / 1000.0));
+            l = Feedback(0, 2 + static_cast<int>(std::round(3 * (0.5f - 0.5f * a))));
+            r = Feedback(0, 2 + static_cast<int>(std::round(3 * (0.5f + 0.5f * a))));
+        }
+
+        // the Master Sword knocked away (Ganon): R2 goes slack until it is back
+        bool ganon_near = false;
+        if (cb) {
+            for (const auto& f : cb->live) {
+                if (f.name.find("Ganon") != std::string::npos && f.distance < 40) ganon_near = true;
+            }
+        }
+        if (!last_weapon.empty() && weapon.empty() && ganon_near) {
+            sword_gone_since = now;
+            Glow({60, 60, 80}, 600, 0.6f);
+        }
+        if (sword_gone_since >= 0) {
+            if (!weapon.empty()) sword_gone_since = -1;
+            else r = Off();
+        }
+        last_weapon = weapon;
+
+        // Gerudo guards: caught = alarm (a scene starts near a guard, then Link is somewhere else)
+        const bool in_event = act.in_event;
+        if (in_event && !was_event) event_start = now;
+        was_event = in_event;
+        if (in_map({"Gerudo"}) && cb && !paused) {
+            for (const auto& o : cb->objects) {
+                if (o.kind == Combat::Kind::Guard && o.distance < 14) guard_seen = now;
+            }
+            const float jump = std::abs(s.x - last_x) + std::abs(s.z - last_z);
+            if (jump > 3 && event_start >= 0 && now - event_start < 6000 && event_start - guard_seen < 2500 && now >= caught_until) {
+                Glow({255, 0, 0}, 1500, 0.9f, true);
+                mic_until = now + 2000;
+                caught_until = now + 5000;
+            }
+            if (now < caught_until - 4300) {
+                r = Feedback(0, 8);
+                l = Feedback(0, 8);
+            }
+        }
+        last_x = s.x;
+        last_z = s.z;
+    }
+
+    std::optional<std::pair<Rgb, float>> Light(long long now) {
+        if (dream && now >= light_until) return std::make_pair(Rgb{120, 70, 200}, 0.35f);
+        if (now < light_from || now >= light_until) return std::nullopt;
+        Rgb c = light;
+        if (light_flicker && uniform(rng) < 0.35) c = {c[0] * 0.35f, c[1] * 0.35f, c[2] * 0.35f};
+        const float fade = std::clamp((light_until - now) / 400.0f, 0.0f, 1.0f);
+        return std::make_pair(c, light_mix * fade);
+    }
+
+private:
+    static u32 H(std::string_view s) {
+        return Hash(s);
+    }
+    void Glow(const Rgb& c, int ms, float mix = 0.85f, bool flicker = false, int delay = 0) {
+        light = c;
+        light_from = now_ms + delay;
+        light_until = light_from + ms;
+        light_mix = mix;
+        light_flicker = flicker;
+    }
+    bool Rise(u32 h, bool v) {
+        const auto it = flags.find(h);
+        const bool had = it != flags.end(), old = had && it->second;
+        flags[h] = v;
+        return had && v && !old;
+    }
+
+    void Poll(long long now, GameData& gd, const std::string& map) {
+        const auto in_map = [&](std::initializer_list<std::string_view> k) {
+            for (const auto x : k) {
+                if (ContainsI(map, x)) return true;
+            }
+            return false;
+        };
+        // time travel in the Temple of Time: white light after a moment of silence
+        const bool c = gd.GetBool(H("Sequence_IsChildhood")).value_or(true);
+        if (child_known && was_child != c && in_map({"TempleOfTime", "ShrineOfTime", "DoorOfTime"})) {
+            Glow({255, 255, 255}, 3500, 0.95f, false, 800);
+        }
+        child_known = true;
+        was_child = c;
+        child = c;
+        dream = in_map({"Dream"});
+
+        // minigames: start shot, timer, score
+        const bool flag = gd.GetBool(H("MiniGame_IsTimerCounting")).value_or(false);
+        const bool down = gd.GetBool(H("MiniGame_IsTimerCountDown")).value_or(false);
+        float val = gd.GetFloat(H("MiniGame_TimerValue")).value_or(0), lim = gd.GetFloat(H("MiniGame_TimerValueLimit")).value_or(0);
+        if (lim > 1000) { val /= 1000; lim /= 1000; }
+        if (std::isnan(timer_val)) timer_val = val;
+        else if (val != timer_val) { timer_val = val; timer_moved = now; }
+        const bool on = flag && now - timer_moved < 1500;
+        const float left = down ? val : lim > 0 ? lim - val : -1;
+        if (on && !timer_on) { Glow({255, 255, 255}, 250, 0.9f); score_game_until = now + 120000; }
+        if (!on && timer_on && timer_left >= 0 && timer_left < 0.6f) { mic_until = now + 1500; Glow({255, 40, 0}, 800, 0.8f); }
+        timer_on = on;
+        timer_left = on ? left : -1;
+        timer_frac = on && lim > 0 && left >= 0 ? std::clamp(left / lim, 0.0f, 1.0f) : -1;
+        const int score = gd.GetInt(H("MiniGame_Score")).value_or(-1), max = gd.GetInt(H("MiniGame_ScoreMax")).value_or(0);
+        if (last_score >= 0 && score > last_score && score - last_score < 1000) {
+            Glow({255, 220, 60}, 180, 0.7f);
+            if ((last_score < 750 && score >= 750) || (last_score < 1400 && score >= 1400)) Glow({255, 200, 40}, 1500, 0.9f);
+            score_game_until = now + 60000;
+        }
+        last_score = score;
+        if (now < score_game_until && !timer_on && max > 0 && score >= 0) timer_frac = std::clamp(score / static_cast<float>(max), 0.0f, 1.0f);
+
+        // the fishing pond: a new record
+        const int fa = gd.GetInt(H("MiniGame_Fishing_RecordFishSize_Adult")).value_or(-1);
+        const int fc = gd.GetInt(H("MiniGame_Fishing_RecordFishSize_Child")).value_or(-1);
+        if ((fish_a >= 0 && fa > fish_a) || (fish_c >= 0 && fc > fish_c)) Glow({255, 210, 60}, 2000, 0.9f, false, 900);
+        fish_a = fa;
+        fish_c = fc;
+
+        // water levels
+        const int water = gd.GetInt(H("WaterTemple_Room00_WaterLevel")).value_or(-1);
+        if (last_water >= 0 && water >= 0 && water != last_water) Glow({30, 110, 255}, 2400, 0.7f);
+        last_water = water;
+        for (const char* n : {"BottomOfTheWell_Room_01_WaterLevel_Down", "InsideTheDekuTree_RoomG_WaterLevel"}) {
+            if (Rise(H(n), gd.GetBool(H(n)).value_or(false))) Glow({30, 110, 255}, 2400, 0.7f);
+        }
+        // ice melts
+        for (const char* n : {"Gimmick_RedIce_Melted", "ForestTemple_Room14_MeltedIce", "ForestTemple_Room27_MeltedIce"}) {
+            if (Rise(H(n), gd.GetBool(H(n)).value_or(false))) Glow({120, 200, 255}, 1200, 0.6f);
+        }
+        // the castle collapses
+        for (const char* n : {"2F_FallDown", "4F_BreakRoom", "AfterStep03", "AfterStep05", "AfterStep08", "AfterStep10",
+                              "StartFireTrap_3F", "OpenLastGate", "SetBackRubble"}) {
+            const u32 h = H(std::string("EscapeFromCrumblingGanonCastle_") + n);
+            if (Rise(h, gd.GetBool(h).value_or(false))) {
+                Glow({255, 80, 0}, 1500, 0.8f, true);
+                escape_until = now + 90000;
+            }
+        }
+        // Ganon
+        const u32 eye = H("Enemy_DungeonBossGanon_IsOpenedThirdEye"), zelda = H("Enemy_DungeonBossGanon_IsZeldaMagicChargeFinish");
+        if (Rise(eye, gd.GetBool(eye).value_or(false))) Glow({255, 215, 90}, 2500, 0.6f);
+        if (Rise(zelda, gd.GetBool(zelda).value_or(false))) Glow({255, 250, 220}, 2000, 0.9f);
+        // cuccos
+        const u32 cucco = H("Cucco_IsAngry");
+        if (Rise(cucco, gd.GetBool(cucco).value_or(false))) Glow({255, 255, 255}, 6000, 0.5f, true);
+
+        // Ingo's race and the Shadow Temple's ship (sequence enums)
+        constexpr u32 EponaSeq = 0x4969f026, ShadowSeq = 0x7a91dbd5;
+        const u32 race = H("GambleRacePlaying"), complete = H("Complete"), ship = H("BattleOnShip");
+        const u32 ep = gd.GetEnum(EponaSeq).value_or(0);
+        if (epona_known && epona_seq != ep) {
+            if (ep == race) Glow({255, 160, 60}, 1200, 0.6f);
+            if (epona_seq == race && ep == complete) Glow({255, 200, 40}, 2500, 0.9f, false, 400);
+        }
+        epona_known = true;
+        epona_seq = ep;
+        racing = ep == race;
+        on_ship = gd.GetEnum(ShadowSeq).value_or(0) == ship && in_map({"Shadow"});
+    }
+
+    long long now_ms = 0, next_poll = 0, mic_until = 0, score_game_until = 0, escape_until = 0, timer_moved = -100000;
+    long long light_from = 0, light_until = 0, sword_gone_since = -1, event_start = -1, guard_seen = -10000, caught_until = 0;
+    std::vector<std::pair<long long, std::function<void()>>> later;
+    std::unordered_map<u32, bool> flags;
+    bool child_known = false, was_child = false, timer_on = false, epona_known = false, light_flicker = false, was_event = false;
+    float timer_left = -1, timer_frac = -1, timer_val = std::numeric_limits<float>::quiet_NaN(), light_mix = 0;
+    float last_x = 0, last_z = 0;
+    int last_score = -1, fish_a = -1, fish_c = -1, last_water = -1;
+    u32 epona_seq = 0;
+    Rgb light{};
+    std::string last_weapon;
+    std::mt19937 rng{7};
+    std::uniform_real_distribution<double> uniform{0.0, 1.0};
+};
+
 // ---------- The loop (Daemon.cs: life, aiming, riding, triggers, lights) ----------
 const u32 HPause = Hash("Sequence_IsPause"), HPauseReq = Hash("Sequence_GamePauseRequestCount");
 const u32 HPrePause = Hash("Sequence_IsPreGamePause"), HChild = Hash("Sequence_IsChildhood");
@@ -900,6 +1544,13 @@ const u32 HArrows = Hash("PouchData.Item_Arrow_Normal.StockNum"), HSeeds = Hash(
 const u32 HMaxLife = Hash("PlayerStatus.MaxLife");
 const u32 HShield = Hash("PlayerStatus.EquipShield"), HBoot = Hash("PlayerStatus.EquipBoot");
 const u32 HArmor = Hash("PlayerStatus.EquipArmor");
+const u32 HRupee = Hash("PlayerStatus.CurrentRupee"), HMp = Hash("PlayerStatus.MP"), HMpMax = Hash("PlayerStatus.MPMax");
+const u32 HNuts = Hash("PouchData.Item_DekuNut.StockNum"), HBombs = Hash("PouchData.Item_Bomb.StockNum");
+const u32 HWalletM = Hash("PouchData.Item_Wallet_Medium.StockNum"), HWalletL = Hash("PouchData.Item_Wallet_Large.StockNum");
+const u32 HWeapon = Hash("PlayerStatus.EquipWeapon");
+// GameNames.cs (PracticeROM / sloperina's gamedata fields): IsGet.<item>, DefeatedEnemyNum.<enemy>
+constexpr std::string_view Items[]{"Armor_Adult_Default_Head", "Armor_Adult_Gauntlet_Gold", "Armor_Adult_Gauntlet_Silver", "Item_AgonyStone", "Item_AlarmCucco", "Item_Arrow_Normal", "Weapon_Base", "Weapon_Sword_Biggoron", "Item_BombBag_Large", "Item_BombBag_Medium", "Item_BombBundle_Small", "Item_BombchuBundle_Large", "Item_BombchuBundle_Medium", "Item_BombchuBundle_Small", "Item_Boomerang", "Item_Bottle_BluePotion", "Item_Bottle_Bug", "Item_Bottle_Fairy", "Item_Bottle_Fish", "Item_Bottle_GreenPotion", "Item_Bottle_HalfMilk", "Item_Bottle_Milk", "Item_Bottle_RedPotion", "Weapon_Sword_BrokenGiant", "Item_BrokenSword", "Item_BulletBag_Large", "Armor_Child_Default_Head", "Armor_Child_Gauntlet_Goron", "Armor_Child_Mask_Amiibo0", "Armor_Child_Mask_Amiibo1", "Armor_Child_Mask_Bunny", "Armor_Child_Mask_Gerudo", "Armor_Child_Mask_Goron", "Armor_Child_Mask_Keaton", "Armor_Child_Mask_Skull", "Armor_Child_Mask_Spooky", "Armor_Child_Mask_Truth", "Armor_Child_Mask_Zora", "Item_ClaimCheck", "Item_CojiroCucco", "Weapon_Shield_DarkLinkShield", "Item_DekuStickBundle_Small", "Item_DekuNut", "Item_DekuSeed", "Item_Dungeon_BossKey", "Item_Dungeon_Compass", "Item_Dungeon_Map", "Item_Dungeon_SmallKey", "Item_Melody_EponaSong", "Item_EyeDrop", "Item_EyeballFrog", "Item_Ocarina_Fairy", "Item_Medal_Fire", "Item_FishingRod", "Item_Medal_Forest", "Weapon_Sword_Giant", "Item_Token_Gold", "Armor_Adult_Goron", "Item_Stone_Fire", "Item_Hammer", "Item_Hat_FishingPondOwner", "Armor_Adult_HoverBoot", "Weapon_Shield_Hylian", "Armor_Adult_HeavyBoot", "Armor_GlassTruth", "Item_Arrow_Fire", "Item_Arrow_Ice", "Item_Arrow_Light", "Item_Bomb", "Item_BombBag_Small", "Item_Bombchu", "Item_Bottle", "Item_Bottle_BigPoe", "Item_Bottle_BlueFire", "Item_Bottle_Letter", "Item_Bottle_Poe", "Item_BulletBag_Medium", "Item_BulletBag_Small", "Item_DekuStick", "Item_DinFire", "Item_FairyBless_DefenseDouble", "Item_FairyBless_MP", "Item_FairyBless_MPDouble", "Item_FaroreWind", "Item_Hookshot", "Item_Longshot", "Item_Melody_FireBolero", "Item_Melody_ForestMinuet", "Item_Melody_SariaSong", "Item_Melody_ShadowNocturne", "Item_Melody_SpiritRequiem", "Item_Melody_StormSong", "Item_Melody_SunSong", "Item_Melody_WaterSerenade", "Item_Melody_ZeldaLullaby", "Item_NayruLove", "Item_Quiver_Small", "Item_ScrubBusinessSeed", "Item_Token_Gerudo", "Item_WeirdEgg", "Pouch_Amiibo", "Weapon_Range_Bow", "Weapon_Range_SlingShot", "Weapon_Shield_Deku", "Weapon_SinkingLure", "Weapon_Sword_Kokiri", "Item_NormalBoot", "Armor_Adult_Normal", "Item_Stone_Forest", "Item_Medal_Light", "Weapon_Lure", "Item_MagicBean", "Armor_Mask_Base", "Weapon_Sword_Master", "Weapon_Shield_Mirror", "Item_NutBag_Large", "Item_NutBag_Medium", "Item_NutBag_Small", "Item_Ocarina_Time", "Item_OddMushroom", "Item_OddPowder", "Item_PoacherSaw", "Item_PocketCucco", "Item_PocketEgg", "Item_Melody_LightPrelude", "Item_Prescription", "Item_Quiver_Large", "Item_Quiver_Medium", "Item_Scale_Gold", "Item_Scale_Silver", "Item_Melody_ScarecrowSong", "Item_Medal_Shadow", "Item_Melody_TimeSong", "Item_Medal_Spirit", "Item_StickBag_Large", "Item_StickBag_Medium", "Item_StickBag_Small", "Weapon_Sword_DarkLinkSword", "Item_Wallet_Large", "Item_Wallet_Medium", "Item_Wallet_Small", "Item_Medal_Water", "Item_ZeldaLetter", "Armor_Adult_Zora", "Item_Stone_Water"};
+constexpr std::string_view Enemies[]{"Enemy_Amos", "Enemy_Anubis", "Enemy_BabyDodongo", "Enemy_Bari", "Enemy_Beamos", "Enemy_Biri", "Enemy_Bubble_Blue", "Enemy_Bubble_Green", "Enemy_Bubble_Green_Big", "Enemy_Bubble_Red", "Enemy_Bubble_White", "Enemy_CrazyFloorTile", "Enemy_DeadHand", "Enemy_Dekubaba", "Enemy_Dekubaba_Withered", "Enemy_Dinolfos", "Enemy_Dodongo", "Enemy_DungeonBoss_Barinade", "Enemy_DungeonBoss_BongoBongo", "Enemy_DungeonBoss_Dodongo", "Enemy_DungeonBoss_Ganon", "Enemy_DungeonBoss_Ganondorf", "Enemy_DungeonBoss_Gohma", "Enemy_DungeonBoss_Kotake", "Enemy_DungeonBoss_Koume", "Enemy_DungeonBoss_Morpha", "Enemy_DungeonBoss_PhantomGanon", "Enemy_DungeonBoss_Twinrova", "Enemy_DungeonBoss_Volvagia", "Enemy_Floormaster", "Enemy_FlyingPot", "Enemy_Freezard", "Enemy_Gibdo", "Enemy_Gohma_Egg", "Enemy_Gohma_Larva", "Enemy_Guay", "Enemy_IronKnuckle_Black", "Enemy_IronKnuckle_Silver", "Enemy_IronKnuckle_White", "Enemy_Keese", "Enemy_Keese_Fire", "Enemy_Keese_Ice", "Enemy_Leever", "Enemy_Leever_Big", "Enemy_LikeLike", "Enemy_Lizalfos", "Enemy_MiddleBoss_BigOcto", "Enemy_MiddleBoss_DarkLink", "Enemy_MiddleBoss_FlareDancer", "Enemy_MiddleBoss_GerudoThief", "Enemy_MiddleBoss_IronKnuckle_Nabooru", "Enemy_MiddleBoss_Lizalfos", "Enemy_MiddleBoss_Poe_Meg", "Enemy_Moblin", "Enemy_Moblin_Club", "Enemy_Octorok", "Enemy_Peahat", "Enemy_Peahat_Larva", "Enemy_Poe", "Enemy_Poe_Amy", "Enemy_Poe_Beth", "Enemy_Poe_Big", "Enemy_Poe_Flat", "Enemy_Poe_Hyrule", "Enemy_Poe_Joelle", "Enemy_Poe_Sharp", "Enemy_ReDead", "Enemy_Scrub_Business", "Enemy_Scrub_Deku", "Enemy_Scrub_Mad", "Enemy_Shabom", "Enemy_ShellBlade", "Enemy_SkullKid", "Enemy_Skulltula", "Enemy_Skulltula_Gold", "Enemy_Skullwalltula", "Enemy_Spike", "Enemy_Stalchild", "Enemy_Stalfos", "Enemy_Stalfos_Weak", "Enemy_Stinger", "Enemy_Tailpasaran", "Enemy_Tektite_Blue", "Enemy_Tektite_Red", "Enemy_Tentacle_Blue", "Enemy_Tentacle_Green", "Enemy_Tentacle_Red", "Enemy_TorchSlug", "Enemy_TrickyDoor", "Enemy_TrickyDoor_SpiritTemple", "Enemy_Wallmaster", "Enemy_Wolfos", "Enemy_Wolfos_White"};
 constexpr float AimFov = 40.0f;
 constexpr long long AimHoldMs = 120;
 
@@ -923,7 +1574,19 @@ void Run(Core::System& system, u64 main_base) {
     bool checked = false;
     std::vector<std::string> names;
     Actions act;
-    std::string shield, boot, armor, map;
+    Combat combat;
+    Scene scene;
+    Events events;
+    Moments mom;
+    std::string shield, boot, armor, map, weapon;
+    long long brace_until = 0, next_telegraph = 0, led_chip_until = 0, led_show_until = 0, lens_until = 0;
+    long long last_mp_drop = 0, fuse_until = 0, next_kills = 0, next_flags = 0;
+    float led_show = 0;
+    int last_rupee = -1, last_mp = -1, last_nuts = -1, last_bombs = -1, last_hour = -1;
+    bool kills_ready = false, flags_ready = false;
+    std::unordered_map<u32, int> kill_state;
+    std::unordered_map<u32, bool> flag_state;
+    std::unordered_map<std::string, long long> recent_kills;
     long long next_strings = 0, aim_since = -1, ride_since = -1, flash_until = 0, flash_ms = 1;
     long long dead_until = 0, dead_at = -1, jolt = 0, r_tick = 0, l_kick = 0, celebrate_until = 0;
     long long led_sweep_until = 0, last_now = 0;
@@ -950,6 +1613,9 @@ void Run(Core::System& system, u64 main_base) {
         GameData gd{oot.mem};
         const State s = oot.Read();
         if (!s.in_game || gd.GetBool(HLoading).value_or(false)) {
+            last_life = last_rupee = last_mp = last_max_life = last_nuts = last_bombs = -1;
+            aim_since = -1;
+            fuse_until = 0;
             PublishOff();
             continue;
         }
@@ -976,6 +1642,8 @@ void Run(Core::System& system, u64 main_base) {
             boot = gd.GetStr(HBoot).value_or("");
             armor = gd.GetStr(HArmor).value_or("");
             map = gd.GetStr(HMap).value_or("");
+            weapon = gd.GetStr(HWeapon).value_or("");
+            scene.SetMap(map);
             next_strings = now + 500;
         }
         const bool iron = boot.find("HeavyBoot") != std::string::npos;
@@ -985,6 +1653,100 @@ void Run(Core::System& system, u64 main_base) {
             flash_ms = ms;
             flash_until = now + ms;
         };
+        // how an enemy dies, by its name (Daemon.Family / KillFx): the flashes and the celebration
+        const auto kill_fx = [&](const std::string& name) {
+            const auto has = [&](std::initializer_list<std::string_view> k) {
+                for (const auto x : k) {
+                    if (ContainsI(name, x)) return true;
+                }
+                return false;
+            };
+            const bool boss = has({"DungeonBoss"}), mid = !boss && has({"MiddleBoss"});
+            const bool token = !boss && !mid && has({"Skulltula_Gold"});
+            const bool ghost = !boss && !mid && !token && !has({"Stalfos", "Stalchild", "IronKnuckle", "Lizalfos", "Dinolfos", "Moblin", "Amos", "Anubis"}) &&
+                               has({"Poe", "Floormaster", "SkullKid"});
+            if (name.find("Ganon") != std::string::npos && boss) {
+                flash_to(255, 255, 255, 4000);
+                celebrate_until = now + 2500;
+            }
+            if (boss) {
+                flash_to(255, 220, 120, 2500);
+                celebrate_until = now + 1400;
+            } else if (mid) {
+                flash_to(255, 200, 120, 1200);
+                celebrate_until = now + 800;
+            } else if (token) {
+                flash_to(255, 200, 0, 300);
+            } else if (ghost) {
+                flash_to(160, 90, 255, 600);
+            }
+        };
+        // enemies: our hits, their deaths, what they are doing
+        combat.Discover(oot.mem, oot.link, now);
+        const auto hits = !paused ? combat.Poll(oot.mem, oot.link, names) : std::vector<Combat::Hit>{};
+        for (const auto& h : hits) {
+            flash_to(255, 245, 220, 110);
+            led_chip_until = now + 90; // the target's life bar loses a chip
+            if (h.killed) {
+                kill_fx(h.name);
+                recent_kills[h.name] = now;
+            }
+        }
+        for (const auto& a : combat.acts) {
+            const std::string& v = a.verb;
+            const bool windup = v.find("Attack") != std::string::npos || v == "Charge" || v == "PrepareWeapon" ||
+                                v == "SpecialAttackPrepare" || v == "PreLaunch" || v == "LandCharge" || v == "Inhale";
+            if (windup && a.distance < 8 && now >= next_telegraph) {
+                brace_until = now + 450; // the shield hand tenses
+                next_telegraph = now + 350;
+                flash_to(255, 170, 40, 160);
+            }
+            if (v == "InterruptBrokenArmor") flash_to(255, 255, 255, 150);
+            if (v == "InterruptWeakPointHit") flash_to(255, 255, 160, 150);
+            if (v == "InterruptRestraintRideOnPlayer" && a.distance < 3) act.grabbed_until = now + 2500;
+            if ((v == "ReleaseRestraint" || v == "Unstick") && a.distance < 3) act.grabbed_until = 0;
+        }
+        const bool enemy_near = combat.nearby > 0 && combat.nearest_distance < 10;
+        const bool boss_near = combat.boss_near;
+        // kills the walk didn't see: the game's per-enemy counters
+        if (now >= next_kills) {
+            for (const auto name : Enemies) {
+                const u32 hash = Hash(std::string("DefeatedEnemyNum.") + std::string(name));
+                const int v = gd.GetInt(hash).value_or(-1);
+                if (v < 0) continue;
+                const std::string n{name};
+                const auto it = kill_state.find(hash);
+                const auto rk = recent_kills.find(n);
+                if (kills_ready && it != kill_state.end() && v > it->second && !(rk != recent_kills.end() && now - rk->second < 1500)) {
+                    kill_fx(n);
+                }
+                kill_state[hash] = v;
+            }
+            kills_ready = true;
+            next_kills = now + 300;
+        }
+        // treasure
+        if (now >= next_flags) {
+            for (const auto name : Items) {
+                const u32 hash = Hash(std::string("IsGet.") + std::string(name));
+                const bool v = gd.GetBool(hash).value_or(false);
+                const auto it = flag_state.find(hash);
+                if (flags_ready && v && it != flag_state.end() && !it->second) {
+                    const auto has = [&](std::string_view k) { return name.find(k) != std::string_view::npos; };
+                    const bool song = has("Melody"), medal = !song && !has("BossKey") && !has("SmallKey") && !has("Map") &&
+                                                             !has("Compass") && (has("Medal") || has("Stone"));
+                    const bool key = !song && has("SmallKey"), boss_key = !song && has("BossKey");
+                    const bool map_item = !song && !boss_key && !key && (has("Map") || has("Compass"));
+                    if (song) flash_to(120, 180, 255, 1300);
+                    else if (medal) flash_to(255, 255, 255, 2500);
+                    else flash_to(255, 200, 40, 1300);
+                    if (!song && !key && !map_item) celebrate_until = now + 900; // an item, a medal, the boss key
+                }
+                flag_state[hash] = v;
+            }
+            flags_ready = true;
+            next_flags = now + 400;
+        }
         if (last_max_life > 0 && max_life > last_max_life) {
             flash_to(255, 60, 120, 1600); // a heart container
             celebrate_until = now + 1500;
@@ -1025,6 +1787,62 @@ void Run(Core::System& system, u64 main_base) {
             flash_to(60, 255, 120, 350);
         }
         last_life = s.life;
+
+        // rupees: a gold flash, the wallet filling on the LEDs; magic: one drop is a spell, a drain the Lens of Truth
+        const int rupee = gd.GetInt(HRupee).value_or(-1), mp = gd.GetInt(HMp).value_or(-1);
+        if (last_rupee >= 0 && rupee > last_rupee) {
+            flash_to(255, 170, 0, 220);
+            const int cap = gd.GetInt(HWalletL).value_or(0) > 0 ? 500 : gd.GetInt(HWalletM).value_or(0) > 0 ? 200 : 99;
+            led_show = std::clamp(rupee / static_cast<float>(cap), 0.05f, 1.0f);
+            led_show_until = now + 1400;
+        }
+        last_rupee = rupee;
+        if (last_mp >= 0 && mp < last_mp) {
+            lens_until = now - last_mp_drop < 1500 ? now + 1500 : lens_until;
+            if (now >= lens_until) flash_to(170, 60, 255, 300);
+            const int mp_max = gd.GetInt(HMpMax).value_or(0);
+            if (mp_max > 0) {
+                led_show = std::clamp(mp / static_cast<float>(mp_max), 0.05f, 1.0f);
+                led_show_until = now + 1200;
+            }
+            last_mp_drop = now;
+        }
+        last_mp = mp;
+        // items used up: a Deku nut's flash, a bomb's fuse
+        const int nuts = gd.GetInt(HNuts).value_or(-1), bombs = gd.GetInt(HBombs).value_or(-1);
+        if (last_nuts >= 0 && nuts < last_nuts) flash_to(255, 255, 240, 450);
+        if (last_bombs >= 0 && bombs < last_bombs) fuse_until = now + 4500;
+        last_nuts = nuts;
+        last_bombs = bombs;
+        // the day turns
+        const int hour = world.seconds >= 0 ? world.seconds / 3600 : -1;
+        if (last_hour >= 0 && hour >= 0 && hour != last_hour && !world.indoor) {
+            if (hour == 6) flash_to(255, 150, 80, 2500);
+            if (hour == 18) flash_to(120, 60, 160, 2500);
+        }
+        last_hour = hour;
+
+        events.Update(now, oot.EventName(), act.in_event, paused, act);
+        mom.Update(now, gd, act, s, map, &combat, weapon, paused);
+
+        // boss signatures: the nearest boss's colour
+        std::optional<Rgb> boss_light;
+        if (!paused) {
+            const Combat::Foe* boss = nullptr;
+            for (const auto& f : combat.live) {
+                if (f.boss && (boss == nullptr || f.distance < boss->distance)) boss = &f;
+            }
+            if (boss) {
+                const std::string& bn = boss->name;
+                const auto has = [&](std::string_view k) { return bn.find(k) != std::string::npos; };
+                boss_light = has("Volvagia") ? Rgb{255, 60, 0}
+                             : has("Twinrova") || has("Kotake") || has("Koume") ? (now / 1500 % 2 == 0 ? Rgb{255, 60, 0} : Rgb{60, 160, 255})
+                             : has("Barinade") ? Rgb{80, 200, 255}
+                             : has("BongoBongo") ? Rgb{90, 0, 140}
+                             : has("Morpha") ? Rgb{20, 90, 255}
+                                             : Rgb{200, 0, 30};
+            }
+        }
         const bool low = s.life > 0 && s.life * 4 <= s.life_max;
         const bool critical = s.life > 0 && s.life <= 4;
 
@@ -1056,7 +1874,10 @@ void Run(Core::System& system, u64 main_base) {
             if (ao.r) r = *ao.r;
             if (ao.l) l = *ao.l;
             if (riding) r = l = Feedback(1, 4); // the reins
+            if (now < brace_until && !riding) l = Feedback(0, 8); // an enemy winds up: the shield hand braces
             if (ao.free_triggers) r = l = Off();
+            if (mom.r) r = *mom.r;
+            if (mom.l) l = *mom.l;
             if (now < celebrate_until) r = l = Machine(1, 9, 6, 2, 30, 2);
             r = Scale(r, TuneR2);
             l = Scale(l, TuneL2);
@@ -1069,9 +1890,25 @@ void Run(Core::System& system, u64 main_base) {
         Rgb c = armor.find("Goron") != std::string::npos  ? Rgb{200, 25, 10}
                 : armor.find("Zora") != std::string::npos ? Rgb{15, 70, 230}
                                                           : Rgb{0, 170, 40};
+        if (const auto place = scene.Light(now)) c = *place;
         if (!world.indoor && world.seconds >= 0) c = TimeOfDay(c, world.seconds);
         if (act.raining && !world.indoor) c = Mix(c, {90, 100, 130}, 0.4f);
         if (ao.light) c = Mix(c, *ao.light, ao.light_mix);
+        if (const auto evl = events.LightNow(now)) c = Mix(c, *evl, 0.85f);
+        if (const auto ml = mom.Light(now)) c = Mix(c, ml->first, ml->second);
+        if (now < lens_until) c = Mix(c, {130, 40, 210}, 0.55f + 0.15f * static_cast<float>(std::sin(now / 1000.0 * 6))); // Lens of Truth
+        if (now < fuse_until) { // the fuse burns faster
+            const bool on = now / (std::max)(60ll, (fuse_until - now) / 12) % 2 == 0;
+            c = Mix(c, on ? Rgb{255, 120, 0} : Rgb{60, 20, 0}, 0.6f);
+        }
+        if (boss_near) {
+            const float p = 0.5f + 0.5f * static_cast<float>(std::sin(now / 1000.0 * 2 * Pi * 0.8));
+            const Rgb bl = boss_light.value_or(Rgb{220, 0, 30});
+            c = Mix(c, {bl[0] * p, bl[1] * p, bl[2] * p}, 0.6f);
+        } else if (enemy_near) {
+            const float p = 0.5f + 0.5f * static_cast<float>(std::sin(now / 1000.0 * 2 * Pi * (1 + 3 / (std::max)(1.0f, combat.nearest_distance))));
+            c = Mix(c, {255, 140 * p, 0}, 0.35f);
+        }
         if (low) {
             const long long period = s.life <= 4 ? 700 : 1000;
             c = Mix(c, {(now % period) < 260 ? 255.0f : 60.0f, 0, 0}, 0.85f);
@@ -1083,16 +1920,34 @@ void Run(Core::System& system, u64 main_base) {
         }
         if (paused) c = {c[0] * 0.25f, c[1] * 0.25f, c[2] * 0.25f};
 
-        // player LEDs, most urgent first: being held (presses), breath, else Link's life (the bow's draw and
-        // spin charge need the pad's input, the boss's and target's life need Combat.cs: not ported yet)
+        // player LEDs, most urgent first: wallet / magic, being held, a moment's bar, breath, the boss's life, the
+        // locked-on enemy's life, else Link's own (the bow's draw, the spin charge and the touchpad's level need the
+        // pad's input: not ported yet)
+        float boss_frac = -1, target_frac = -1;
+        for (const auto& f : combat.live) {
+            if (f.boss && f.distance < 30) boss_frac = (std::max)(boss_frac, f.life / static_cast<float>(f.max));
+        }
+        if (act.HasVerb("LockOnWait") || act.HasVerb("LockOnMove")) {
+            const Combat::Foe* best = nullptr;
+            for (const auto& f : combat.live) {
+                if (f.front > 0.5f && f.distance < 15 && (best == nullptr || f.distance < best->distance)) best = &f;
+            }
+            if (best) target_frac = best->life / static_cast<float>(best->max);
+        }
         const bool grabbed_now = now < act.grabbed_until;
-        const int src = grabbed_now ? 5 : act.air_left >= 0 ? 7 : 10;
-        const float bar = src == 5   ? (std::min)(1.0f, act.grab_presses / 8.0f)
+        const int src = now < led_show_until ? 4 : grabbed_now ? 5 : mom.bar >= 0 ? 6 : act.air_left >= 0 ? 7
+                        : boss_frac >= 0 ? 8 : target_frac >= 0 ? 9 : 10;
+        const float bar = src == 4   ? led_show
+                          : src == 5 ? (std::min)(1.0f, act.grab_presses / 8.0f)
+                          : src == 6 ? mom.bar
                           : src == 7 ? act.air_left
+                          : src == 8 ? boss_frac
+                          : src == 9 ? target_frac
                                      : (s.life_max > 0 ? (std::max)(0, s.life) / static_cast<float>(s.life_max) : 0.0f);
         int leds = static_cast<int>(std::ceil(5 * std::clamp(bar, 0.0f, 1.0f)));
+        if (now < led_chip_until && (boss_frac >= 0 || target_frac >= 0)) leds = (std::max)(0, leds - 1); // a chip breaks off
         if (act.air_left >= 0 && act.air_left < 0.25f && now % 400 < 200) leds = 0; // last breath blinks
-        if (critical && now % 650 >= 260 && !aiming) leds = 0;                     // the last heart blinks with the beat
+        if (critical && now % 650 >= 260 && now >= led_show_until && !aiming) leds = 0; // the last heart blinks with the beat
         int led_mask = (1 << leds) - 1;
         // a new meter announces itself: one light runs across before it shows its value
         if (src != led_src) {
@@ -1102,10 +1957,10 @@ void Run(Core::System& system, u64 main_base) {
         if (now < led_sweep_until) {
             led_mask = 1 << static_cast<int>(std::clamp<long long>((now - (led_sweep_until - 240)) / 48, 0, 4));
         }
-        const u8 mic = s.life > 0 && s.life <= 4 ? 2 : 0;
+        const u8 mic = (std::max)(static_cast<u8>(s.life > 0 && s.life <= 4 ? 2 : boss_near ? 1 : 0), mom.mic);
         // the light glides between colours (~80 ms); flashes, alarms and blinking cut straight through
         const bool hard_cut = now < flash_until || low || now < dead_until || paused || ao.light_mix >= 0.95f ||
-                              now < act.terror_until;
+                              mom.escaping || now < act.terror_until;
         const float k = hard_cut ? 1.0f : 1.0f - std::exp(-dt / 0.08f);
         for (int i = 0; i < 3; i++) {
             light_now[i] += (c[i] - light_now[i]) * k;
