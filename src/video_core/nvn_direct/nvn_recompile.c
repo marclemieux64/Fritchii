@@ -180,12 +180,13 @@ void vka_rc_cs_c0(const vka_shader* sh, const vka_bstate* s, uint8_t* d) {
 typedef struct {
     const vka_dstate* d; int st; const rc_control* control; const uint8_t* code; uint32_t ncode;
     uint8_t drv[3][DMSH_DRV_SIZE], have[3], cs_c0[DMSH_DRV_SIZE], have_cs;
+    unsigned state_reads;   // Fritchii: reads of anything but the shader's own code and constants (keep_drawless)
 } rc_ctx;
 // Fritchii: a translation without a draw (vka_rc_prepare, speculative ones) answers the storage buffer table of c[0] with these placeholders, so the recompiler
 // takes each slot as a storage buffer, as it does with a draw's bound buffers, instead of global memory with range checks (another SPIR-V)
 #define RC_FAKE_SSBO 0x7ff0000000000000ull
 static int rc_read(void* ctx, uint64_t addr, void* out, size_t n) {
-    (void)ctx;
+    if (ctx) ((rc_ctx*)ctx)->state_reads++;
     if ((addr & 0xfff0000000000000ull) == RC_FAKE_SSBO) { memset(out, 0, n); return 1; }
     if (vka_addr(addr, n, NULL, NULL, NULL)) { memcpy(out, (const void*)(uintptr_t)nvn_direct_host_of(addr), n); return 1; }
     return !plat_mem_read(addr, out, n);
@@ -193,6 +194,7 @@ static int rc_read(void* ctx, uint64_t addr, void* out, size_t n) {
 static int c0_ssbo_table(int st);
 static uint32_t rc_cbuf(void* ctx, uint32_t bank, uint32_t off) {
     rc_ctx* x = ctx; uint32_t v = 0;
+    if (bank != 1) x->state_reads++;
     if (bank == 1) {   // the shader's own constants (rc_c1_range)
         uint32_t a, e; rc_c1_range(x->control, &a, &e);
         if (a <= e && e <= x->ncode && off + 4 <= e - a) memcpy(&v, x->code + a + off, 4);
@@ -226,7 +228,7 @@ static uint32_t rc_cbuf(void* ctx, uint32_t bank, uint32_t off) {
 }
 int vka_tex_id_format(int id);   // vka_tex.c
 static int rc_texture(void* ctx, uint32_t handle, uint32_t* target, int32_t* vk_format) {
-    (void)ctx;
+    ((rc_ctx*)ctx)->state_reads++;
     int id = (int)(handle & 0xfffff), t = id ? vka_tex_id_target(id) : -1, f = id ? vka_tex_id_format(id) : -1;
     if (t < 0) return 0;
     vka_fmt vf; *target = (uint32_t)t; *vk_format = f >= 0 && vka_fmt_of(f, &vf) ? (int32_t)vf.view : 0;
@@ -376,7 +378,9 @@ static unsigned rc_first_binding(int vks) { int r = vks == DMSH_VK_STAGE_CS || v
 // A stage translated with draw d's state: 1 with *o filled (given back with vka_shader_translated_free), *vin_types the vertex inputs' types
 // it was made for (DMSH_VK_TYPE_* by location); gl_depth: the depth mode it is made for; else 0 and why
 static _Thread_local int t_mesh_fb;   // Fritchii: rc_translate emits a mesh program for the mesh emulation (vka_rc_mesh_fb)
-static _Thread_local const uint8_t* t_code;   // Fritchii: the code vka_rc_prepare translates, in place of a program's code area in guest memory
+static _Thread_local const uint8_t* t_code;
+static _Thread_local unsigned t_state_reads;
+static _Thread_local const uint8_t (*t_prefill)[DMSH_DRV_SIZE];   // Fritchii: c[0], c[2] and the push bank filled on the frame thread (asynchronous translations)   // Fritchii: the last rc_translate's rc_ctx state_reads on this thread   // Fritchii: the code vka_rc_prepare translates, in place of a program's code area in guest memory
 static int rc_translate(const prog_t* p, unsigned i, const rc_control* control, const vka_dstate* d, uint32_t prim_inputs, int gl_depth, nvn_direct_shader* o, uint64_t* vin_types, char* why, size_t whyn) {
     int st = (int)control->stage;
     uint32_t nctl, ncode; nvn_ctl_lens(control->bytes, &nctl, &ncode);
@@ -385,7 +389,8 @@ static int rc_translate(const prog_t* p, unsigned i, const rc_control* control, 
     if (st > 7 || rc_vks(st) < 0) { snprintf(why, whyn, "NVN stage %d", st); return 0; }
     if (!t_code && (!data || !ncode || !vka_addr(data, ncode, NULL, NULL, NULL))) { snprintf(why, whyn, "its code area (%u bytes at %#llx) is not in a memory pool", ncode, (unsigned long long)data); return 0; }
     rc_ctx* x = calloc(1, sizeof *x); if (!x) { snprintf(why, whyn, "out of memory"); return 0; }
-    x->d = d; x->st = st; x->control = control; x->code = t_code ? t_code : (const uint8_t*)(uintptr_t)nvn_direct_host_of(data); x->ncode = ncode;
+    x->d = d; x->st = st; x->control = control;
+    if (t_prefill) { memcpy(x->drv, t_prefill, sizeof x->drv); x->have[0] = x->have[1] = x->have[2] = 1; } x->code = t_code ? t_code : (const uint8_t*)(uintptr_t)nvn_direct_host_of(data); x->ncode = ncode;
     nvn_direct_shader_source src = {.nvn_stage = (uint32_t)st, .control = control->bytes, .code = x->code, .code_size = ncode, .code_address = t_code ? 0 : nvn_direct_guest_of(data),
                                     .first_binding = rc_first_binding(rc_vks(st)), .convert_depth = gl_depth, .per_primitive_inputs = st == 1 ? prim_inputs : 0, .context = x,
                                     .read_cbuf = rc_cbuf, .read_memory = rc_read, .texture_info = rc_texture, .mesh_fallback = st == 7 && t_mesh_fb};
@@ -396,6 +401,7 @@ static int rc_translate(const prog_t* p, unsigned i, const rc_control* control, 
             *vin_types |= (uint64_t)(vf.kind == 1 ? DMSH_VK_TYPE_UINT : vf.kind == 2 ? DMSH_VK_TYPE_SINT : DMSH_VK_TYPE_FLOAT) << (2 * loc);
         }
     int ok = vka_shader_translate(&src, o);
+    t_state_reads = x->state_reads;
     free(x);
     if (!ok) { snprintf(why, whyn, "%s", o->error); return 0; }
     return 1;
@@ -543,6 +549,35 @@ static void prep_compare(uint64_t key, const nvn_direct_shader* o, const prog_t*
     VLOG("recompiler: prepared %016llx (stage %d) differs: draw %zu words, draw-less %zu words, draw-less hash %s the prepared one", (unsigned long long)key, st, o->spirv_words, q.spirv_words, spirv_hash(&q) == h ? "matches" : "differs from");
     vka_shader_translated_free(&q);
 }
+// Fritchii: a draw-less translation (vka_rc_prepare, spec_one) that read nothing but the shader's own code and constants (rc_ctx state_reads 0) is the
+// one a draw makes too (prep_compare: 497 of 512 pixel and 285 of 398 vertex shaders the same at the Kokiri save), so it is kept as a draw's would be:
+// in vk_recompiled.bin and in this run's table, under the slot a draw without per-primitive inputs looks up (rc_new). The first draw then needs no translation
+// on the frame path. A vertex shader's inputs are typed float here (no draw): the draw retypes integer attributes (vka_draw.c vin_format), as with any
+// kept translation. FRITCHII_KEEP_DRAWLESS=0: not kept (as before)
+static unsigned g_kept_drawless;
+static void keep_drawless(uint64_t key, const rc_control* control, const nvn_direct_shader* o, uint64_t vin_types, const uint8_t* c1, uint32_t c1_len) {
+    static int on = -1; if (on < 0) { const char* e = getenv("FRITCHII_KEEP_DRAWLESS"); on = !(e && e[0] == '0'); }
+    if (!on || t_state_reads) return;
+    const int gl_depth = !vka_depth_zero();
+    const uint64_t slot = rc_translation_slot(key, 0, (int)control->stage, gl_depth);
+    rc_rec r = {RC_REC_MAGIC, 0, slot, key, 0, gl_depth, o->per_primitive_outputs, vin_types, {o->local[0], o->local[1], o->local[2]}, o->shared, o->input_mask, o->output_mask, o->ssbo_align,
+                o->uses_render_area, o->desc_count, (uint32_t)o->spirv_words, c1_len, (uint32_t)rc_control_bytes(control), o->hprog ? o->hprog_words : 0};
+    r.size = (uint32_t)(sizeof r + rc_rec_rest(&r));
+    uint8_t* m = malloc(r.size); if (!m) return;
+    uint8_t* w = m; memcpy(w, &r, sizeof r); w += sizeof r;
+    memcpy(w, o->descs, sizeof *o->descs * o->desc_count); w += sizeof *o->descs * o->desc_count;
+    memcpy(w, o->spirv, 4 * o->spirv_words); w += 4 * o->spirv_words;
+    memcpy(w, control, rc_control_bytes(control)); w += rc_control_bytes(control);
+    if (c1_len) { memcpy(w, c1, c1_len); w += c1_len; }
+    if (r.hprog_words) memcpy(w, o->hprog, 4 * r.hprog_words);
+    pthread_mutex_lock(&g_mu); disk_open();
+    if (rc_find(&g_disk, slot)) { pthread_mutex_unlock(&g_mu); free(m); return; }
+    rc_put(&g_disk, slot, m);
+    if (g_disk_f) { fwrite(m, 1, r.size, g_disk_f); fflush(g_disk_f); }
+    const unsigned n = ++g_kept_drawless;
+    pthread_mutex_unlock(&g_mu);
+    if (n == 1 || !(n & (n - 1))) VLOG("recompiler: %u draw-less translations kept (they read no draw state: a draw uses them as they are)", n);
+}
 // One program from the game files (the shader warm-up's extraction): keyed as nvnProgramSetShaders keys it (hle_nvn.c keys_hash), translated without a draw
 // and its library made for the driver's caches, as a speculative translation is (spec_one), and marked so later runs leave it. 1 made, 0 known already, -1 failed
 int vka_rc_prepare(const uint8_t* control, size_t nctl, const uint8_t* code, size_t ncode_have) {
@@ -569,6 +604,7 @@ int vka_rc_prepare(const uint8_t* control, size_t nctl, const uint8_t* code, siz
     uint32_t a0, c1e; rc_c1_range(rc, &a0, &c1e); uint32_t c1_len = a0 < c1e && c1e <= ncode ? c1e - a0 : 0;
     char err[200]; err[0] = 0;
     vka_shlib* L = b && !*why ? rc_lib(key, rc_vks(st), 0, &o, b, o.desc_count, c1_len ? code + a0 : NULL, c1_len, vin_types, err, sizeof err) : NULL;
+    if (L) keep_drawless(key, rc, &o, vin_types, c1_len ? code + a0 : NULL, c1_len);
     free(b); vka_shader_translated_free(&o);
     vka_shader* s = L ? vka_shader_scratch(L, key) : NULL;
     if (s) {   // at most 4 pipeline builds in the driver at once: AMD's crashed in its own thread with 22 (translations stay on every thread)
@@ -631,6 +667,8 @@ static void rc_make(rc_shader* r, uint64_t key, const nvn_direct_shader* o, cons
         memset(r->sh->loop_guard.ptr, 0, 16); guard_add(key, &r->sh->loop_guard); }
 }
 // A shader met for the first time in this run: kept from an earlier run, or translated now with the draw's state (caller holds g_make_mu)
+static void rc_finish(rc_shader* r, uint64_t key, uint64_t slot, const rc_control* control, nvn_direct_shader* op, int ok, int kept, const uint8_t* c1, uint32_t c1_len,
+                      uint64_t vin_types, uint32_t prim_inputs, char* why, uint64_t t0);
 static rc_shader* rc_new(const prog_t* p, unsigned i, uint64_t key, uint64_t slot, const rc_control* control, uint32_t prim_inputs, int gl_depth) {
     rc_shader* r = calloc(1, sizeof *r); r->st = (int)control->stage;
     nvn_direct_shader o; uint64_t vin_types = 0; char why[300] = "";
@@ -646,9 +684,16 @@ static rc_shader* rc_new(const prog_t* p, unsigned i, uint64_t key, uint64_t slo
             disk_put(slot, key, prim_inputs, &o, vin_types, gl_depth, control, c1, c1_len);
         }
     }
+    rc_finish(r, key, slot, control, &o, ok, kept, c1, c1_len, vin_types, prim_inputs, why, t0);
+    return r;
+}
+// The rest of rc_new, also for an asynchronous translation (caller holds g_make_mu): the shader made from translation o, put in the table
+static void rc_finish(rc_shader* r, uint64_t key, uint64_t slot, const rc_control* control, nvn_direct_shader* op, int ok, int kept, const uint8_t* c1, uint32_t c1_len,
+                      uint64_t vin_types, uint32_t prim_inputs, char* why, uint64_t t0) {
+    nvn_direct_shader o = *op;
     if (ok) {
         if (kept) g_cached++;
-        rc_make(r, key, &o, control, c1, c1_len, vin_types, prim_inputs, why, sizeof why);
+        rc_make(r, key, &o, control, c1, c1_len, vin_types, prim_inputs, why, 300);
         if (!kept) vka_shader_translated_free(&o);
         if (*why || !r->sh) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 64) VRED("recompiled shader %016llx (NVN stage %d): %s", (unsigned long long)key, r->st, *why ? why : "refused"); }
     } else {
@@ -661,12 +706,72 @@ static rc_shader* rc_new(const prog_t* p, unsigned i, uint64_t key, uint64_t slo
         VLOG("recompiler: %016llx (NVN stage %d) in %llu ms; %u made (%u kept from earlier runs, %u of them ahead), %u not translated, %u with bindings the replay cannot fill", (unsigned long long)key, r->st,
              (unsigned long long)ms, made, (unsigned)g_cached, (unsigned)g_ahead, (unsigned)g_failed, (unsigned)g_unplaced);
     pthread_mutex_lock(&g_mu); rc_put(&g_sh, slot, r); pthread_mutex_unlock(&g_mu);
-    return r;
 }
 // Making a shader (the frame path translating it, a prewarm thread taking it from the file): one at a time, so a key gets one vka_shader, the one
 // the pipelines made ahead were keyed with
 static pthread_mutex_t g_make_mu = PTHREAD_MUTEX_INITIALIZER;
 static rc_shader* rc_lookup(uint64_t slot) { pthread_mutex_lock(&g_mu); rc_ent* e = rc_find(&g_sh, slot); rc_shader* r = e ? e->val : NULL; pthread_mutex_unlock(&g_mu); return r; }
+
+// ---------- Asynchronous translations (Fritchii) ----------
+// A draw that meets a shader no earlier run kept translated it on the frame path: 10-200 ms a submission while walking into new views (Kokiri, 2026-11-22),
+// the drops the player sees. Now, when the draw may be skipped (vka_draw.c sets vka_rc_defer: its pass is open on targets drawn in the frames before, as for
+// pipelines, vka_pso.c), the translation goes to a background thread with a copy of the draw's state, and the draws are skipped until it is in the table
+// (a frame or two). The draw's own state is translated, so what is drawn is what the frame path would have drawn. Not deferred: compute and mesh programs,
+// a pass's first draw, kept translations (taken at once). FRITCHII_RC_ASYNC=0: as before
+_Thread_local int vka_rc_defer, vka_rc_pending;
+typedef struct rc_job { struct rc_job* next; prog_t p; unsigned i; uint64_t key, slot; const rc_control* control; uint32_t prim; int gl_depth; vka_dstate d; uint8_t drv[3][DMSH_DRV_SIZE]; uint64_t queued; } rc_job;
+static rc_job *g_rj_head, **g_rj_tail = &g_rj_head; static pthread_mutex_t g_rj_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_rj_cv = PTHREAD_COND_INITIALIZER;
+static rc_map g_rj_pending; static int g_rj_started; static _Atomic unsigned g_rj_done, g_rj_skips; static _Atomic uint64_t g_rj_wait_ns;
+static int rc_async_on(void) { static int on = -1; if (on < 0) { const char* e = getenv("FRITCHII_RC_ASYNC"); on = !(e && e[0] == '0'); } return on; }
+static void* rj_main(void* a) {
+    (void)a;
+    for (;;) {
+        pthread_mutex_lock(&g_rj_mu); while (!g_rj_head) pthread_cond_wait(&g_rj_cv, &g_rj_mu);
+        rc_job* j = g_rj_head; g_rj_head = j->next; if (!g_rj_head) g_rj_tail = &g_rj_head; pthread_mutex_unlock(&g_rj_mu);
+        if (vka_stopping()) { free(j); continue; }
+        nvn_direct_shader o; memset(&o, 0, sizeof o); uint64_t vin = 0; char why[300] = ""; const uint64_t t0 = now_ns();
+        t_prefill = (const uint8_t (*)[DMSH_DRV_SIZE])j->drv;
+        const int ok = rc_translate(&j->p, j->i, j->control, &j->d, j->prim, j->gl_depth, &o, &vin, why, sizeof why);
+        t_prefill = NULL;
+        uint32_t a0, c1e; rc_c1_range(j->control, &a0, &c1e);
+        const uint8_t* c1 = (const uint8_t*)(uintptr_t)nvn_direct_host_of(j->p.sd[j->i].data) + a0; const uint32_t c1_len = a0 < c1e ? c1e - a0 : 0;
+        if (ok) disk_put(j->slot, j->key, j->prim, &o, vin, j->gl_depth, j->control, c1, c1_len);
+        if (vka_stopping()) { if (ok) vka_shader_translated_free(&o); free(j); continue; }
+        pthread_mutex_lock(&g_make_mu);
+        if (!rc_lookup(j->slot)) {
+            rc_shader* r = calloc(1, sizeof *r); r->st = (int)j->control->stage; if (ok) r->prim = o.per_primitive_outputs;
+            rc_finish(r, j->key, j->slot, j->control, &o, ok, 0, c1, c1_len, vin, j->prim, why, t0);
+        } else if (ok) vka_shader_translated_free(&o);
+        pthread_mutex_unlock(&g_make_mu);
+        pthread_mutex_lock(&g_rj_mu); rc_put(&g_rj_pending, j->slot, NULL); pthread_mutex_unlock(&g_rj_mu);
+        atomic_fetch_add(&g_rj_wait_ns, now_ns() - j->queued);
+        const unsigned n = ++g_rj_done;
+        if (n == 1 || !(n & (n - 1)) || n % 256 == 0)
+            VLOG("recompiler: %u translations made off the frame path (average %.1f ms from the first draw to the shader, %u draws skipped meanwhile)", n, atomic_load(&g_rj_wait_ns) / 1e6 / n, (unsigned)g_rj_skips);
+        free(j);
+    }
+    return NULL;
+}
+// 1: the translation of slot is queued or running (the draw is skipped); 0: not deferred (translate on the frame path)
+static int rj_defer(const prog_t* p, unsigned i, uint64_t key, uint64_t slot, const rc_control* control, uint32_t prim, int gl_depth) {
+    pthread_mutex_lock(&g_rj_mu);
+    rc_ent* e = rc_find(&g_rj_pending, slot);
+    if (e && e->val) { pthread_mutex_unlock(&g_rj_mu); g_rj_skips++; return 1; }
+    rc_job* j = calloc(1, sizeof *j);
+    if (!j) { pthread_mutex_unlock(&g_rj_mu); return 0; }
+    if (!g_rj_started) {
+        g_rj_started = 1;
+        for (int k = 0; k < 2; k++) { pthread_t t; if (pthread_create(&t, NULL, rj_main, NULL) == 0) pthread_detach(t); }
+    }
+    j->p = *p; j->i = i; j->key = key; j->slot = slot; j->control = control; j->prim = prim; j->gl_depth = gl_depth; j->d = *g_draw; j->queued = now_ns();
+    const int st = (int)control->stage, banks[3] = {0, 2, DMSH_PUSH_BANK};
+    for (int k = 0; k < 3; k++) vka_drv_fill(&g_draw->b, st, banks[k], 0, j->drv[k]);
+    rc_put(&g_rj_pending, slot, (void*)1);
+    *g_rj_tail = j; g_rj_tail = &j->next; pthread_cond_signal(&g_rj_cv);
+    pthread_mutex_unlock(&g_rj_mu);
+    g_rj_skips++;
+    return 1;
+}
 // The recompiled shader of program p's stage i (key), translated at its first use with the draw's state (or as an earlier run kept it); *st its
 // NVN stage (-1: no control section kept for the key). prim_inputs: a pixel shader's generic inputs its program's mesh shader writes per primitive
 // (PerPrimitiveEXT, flag DMSH_VK_F_MESH_PRIM: a shader of its own, valid only in a mesh pipeline). gl_depth: the depth mode a depth stage is translated
@@ -677,6 +782,10 @@ vka_shader* vka_rc_shader(const prog_t* p, unsigned i, uint64_t key, uint32_t pr
     if (!control) return NULL;
     uint64_t slot = rc_translation_slot(key, prim_inputs, (int)control->stage, gl_depth);
     rc_shader* r = rc_lookup(slot);
+    if (!r && vka_rc_defer && g_draw && control->stage <= 4 && rc_async_on()) {   // (vertex to geometry stages; compute and mesh programs are never deferred)
+        pthread_mutex_lock(&g_mu); disk_open(); const int known = rc_find(&g_disk, slot) != NULL; pthread_mutex_unlock(&g_mu);
+        if (!known && rj_defer(p, i, key, slot, control, prim_inputs, gl_depth)) { vka_rc_pending = 1; *st = (int)control->stage; return NULL; }
+    }
     if (!r) {
         pthread_mutex_lock(&g_make_mu);
         if (!(r = rc_lookup(slot))) r = rc_new(p, i, key, slot, control, prim_inputs, gl_depth);
@@ -743,6 +852,7 @@ static void spec_one(spec_item it) {
     const uint8_t* c1 = (const uint8_t*)(uintptr_t)nvn_direct_host_of(it.data) + a0;
     char err[200]; err[0] = 0;
     vka_shlib* L = b && !*why ? rc_lib(it.key, rc_vks(st), 0, &o, b, o.desc_count, c1_len ? c1 : NULL, c1_len, vin_types, err, sizeof err) : NULL;
+    if (L) keep_drawless(it.key, it.control, &o, vin_types, c1_len ? c1 : NULL, c1_len);
     free(b); vka_shader_translated_free(&o);
     vka_shader* s = L ? vka_shader_scratch(L, it.key) : NULL;
     if (s && st == 5) vka_cs_ahead_shader(s);

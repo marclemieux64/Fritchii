@@ -346,6 +346,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     // The pixel stage last: drawn after the program's mesh shader, it reads that shader's per-primitive outputs as such (vka_rc_shader prim_inputs)
     // Lichii: the pre-rasterization stages in the depth mode now (resolved again for the program after a switch: the other mode's translations stay kept)
     uint32_t prim = 0; const int gl_depth = !vka_depth_zero(); out->depth = (uint8_t)(1 + gl_depth);
+    extern _Thread_local int vka_rc_pending; vka_rc_pending = 0;
     for (int pass = 0; pass < 2; pass++)
         for (unsigned i = 0; i < p->nstage && i < 6; i++) {
             uint8_t md[8];
@@ -358,6 +359,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
             out->sh[st] = sh;
             if (!sh) out->bad |= 1u << st;
         }
+    if (vka_rc_pending) { out->bad |= VKA_BAD_PENDING; return 1; }   // (not kept: the next draw looks again)
     vka_prog_put(p->serial, out);
     return 1;
 }

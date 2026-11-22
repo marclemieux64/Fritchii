@@ -745,7 +745,8 @@ static void astc_gpu_flush(VkCommandBuffer cb) { if (g_adopt.astc_flush) g_adopt
 int vka_astc_opaque(const void *blocks, size_t n) { return g_adopt.astc_opaque && g_adopt.astc_opaque(blocks, n); }   // Lichii: BC1 for opaque ASTC (vka_tex.c astc_bc1)
 // Lichii's shader recompiler (nvn_direct_device.shader_translate): a program stage translated, its result given back with vka_shader_translated_free
 int vka_shader_translate(const nvn_direct_shader_source *s, nvn_direct_shader *o) {
-    if (g_adopt.shader_translate) return g_adopt.shader_translate(g_adopt.shader_context, s, o);
+    extern _Thread_local uint64_t vka_translate_ns;   // (this thread's: the heavy-submission line, vka_worker.c)
+    if (g_adopt.shader_translate) { const uint64_t t0 = now_ns(); const int ok = g_adopt.shader_translate(g_adopt.shader_context, s, o); vka_translate_ns += now_ns() - t0; return ok; }
     memset(o, 0, sizeof *o); snprintf(o->error, sizeof o->error, "no shader recompiler"); return 0;
 }
 void vka_shader_translated_free(nvn_direct_shader *o) { if (g_adopt.shader_free) g_adopt.shader_free(g_adopt.shader_context, o); }

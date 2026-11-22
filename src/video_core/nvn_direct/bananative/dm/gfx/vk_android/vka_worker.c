@@ -68,6 +68,7 @@ static void aff_check(void) {
     if (r != r_was) { r_was = r; if (r) { aff_set(0, r); VLOG("DM_VK_AFF_REPLAY=%#x", r); } }
 }
 void fritchii_hitch_add(int which, unsigned long long ns);   // Fritchii (common/nx2_hitch.cpp): 0 recording, 1 idle, 6 the game waiting for room
+_Thread_local uint64_t vka_translate_ns;   // Fritchii: this thread's time in shader translations (nvn_recompile.c rc_translate)
 static void *worker_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-replay");
     for (;;) {
@@ -79,7 +80,7 @@ static void *worker_main(void *arg) {
         pthread_mutex_unlock(&g_mu);
         uint64_t t1 = wns(), c1 = j.kind == J_SUB ? thread_cpu_ns() : 0; g_idle_ns += t1 - t0;
         extern _Atomic uint64_t vka_cat_ns[5], vka_img_create_ns, vka_up_total_ns, vka_up_total_bytes; uint64_t vka_exec_draws(void);
-        uint64_t pso0 = 0, img0 = atomic_load(&vka_img_create_ns), up0 = atomic_load(&vka_up_total_ns), ub0 = atomic_load(&vka_up_total_bytes), dr0 = vka_exec_draws(); for (int k = 0; k < 5; k++) pso0 += atomic_load(&vka_cat_ns[k]);
+        uint64_t pso0 = 0, tr0 = vka_translate_ns, img0 = atomic_load(&vka_img_create_ns), up0 = atomic_load(&vka_up_total_ns), ub0 = atomic_load(&vka_up_total_bytes), dr0 = vka_exec_draws(); for (int k = 0; k < 5; k++) pso0 += atomic_load(&vka_cat_ns[k]);
         aff_check();
         if (j.kind == J_SUB) {
             vka_rp_queue_activate(j.serial); vka_rp_set_queue_origin(j.origin_ll);
@@ -98,9 +99,9 @@ static void *worker_main(void *arg) {
             if (pso1 > pso0) fritchii_hitch_add(4, pso1 - pso0);
             if (img1 > img0) fritchii_hitch_add(5, img1 - img0);
             if (t2 - t1 > 16000000ull) { static _Atomic int nh; if (atomic_fetch_add(&nh, 1) < 2000)   // Fritchii: what a heavy submission's recording went to
-                VLOG("heavy submission (fence %llu, %d command buffers): recorded in %.1f ms: %llu draws, texture uploads %.1f ms (%.1f MiB), pipelines %.1f ms, image creates %.1f ms",
-                     (unsigned long long)j.fence, j.nh, (t2 - t1) / 1e6, (unsigned long long)(vka_exec_draws() - dr0), (atomic_load(&vka_up_total_ns) - up0) / 1e6,
-                     (atomic_load(&vka_up_total_bytes) - ub0) / 1048576.0, (pso1 - pso0) / 1e6, (img1 - img0) / 1e6); } }
+                VLOG("heavy submission (fence %llu, %d command buffers): recorded in %.1f ms (CPU %.1f): %llu draws, texture uploads %.1f ms (%.1f MiB), pipelines %.1f ms, image creates %.1f ms, shader translations %.1f ms",
+                     (unsigned long long)j.fence, j.nh, (t2 - t1) / 1e6, (thread_cpu_ns() - c1) / 1e6, (unsigned long long)(vka_exec_draws() - dr0), (atomic_load(&vka_up_total_ns) - up0) / 1e6,
+                     (atomic_load(&vka_up_total_bytes) - ub0) / 1048576.0, (pso1 - pso0) / 1e6, (img1 - img0) / 1e6, (vka_translate_ns - tr0) / 1e6); } }
         if (j.kind == J_SUB) { g_sub_ns += t2 - t1; atomic_fetch_add_explicit(&g_sub_all, t2 - t1, memory_order_relaxed); atomic_fetch_add_explicit(&g_sub_cpu_all, thread_cpu_ns() - c1, memory_order_relaxed); }
         if (j.kind == J_PRESENT && j.ticket % 300 == 0) {
             static uint64_t pcpu; const uint64_t cpu = atomic_load(&g_sub_cpu_all);   // (Fritchii: its CPU time in them: far below the wall time = blocked, not busy)

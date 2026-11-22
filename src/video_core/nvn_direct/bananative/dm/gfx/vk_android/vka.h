@@ -415,7 +415,8 @@ typedef struct vka_shader {
 // (1 + gl_depth: the pre-rasterization stages are translated for one, vka_rc_shader; 0: any)
 typedef struct { vka_shader *sh[VKA_NSTAGE]; unsigned bad; uint8_t depth; } vka_progsh;
 int vka_progsh_current(const vka_progsh *ps);   // 1 = ps's shaders fit the depth mode now
-#define VKA_BAD_MISSING (1u << VKA_NSTAGE)   // vka_progsh.bad: a stage's shader is not in the library (its NVN stage unknown)
+#define VKA_BAD_MISSING (1u << VKA_NSTAGE)
+#define VKA_BAD_PENDING (2u << VKA_NSTAGE)   // Fritchii: a stage's translation runs in the background (nvn_recompile.c rj_defer): its draws are skipped, the result not kept   // vka_progsh.bad: a stage's shader is not in the library (its NVN stage unknown)
 int vka_prog_shaders(const prog_t *p, vka_progsh *out);      // 1 = resolved (stages the program lacks are NULL); 0 = no program
 void vka_prog_put(uint64_t serial, const vka_progsh *ps);   // a program made by the host itself (the selftest), by serial
 vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key);

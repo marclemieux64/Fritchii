@@ -1342,8 +1342,8 @@ static int resolve(const prog_t *p, int st, vka_shader **out, unsigned *bad) {
     vka_progsh ps;
     uint64_t sr = p->serial; typeof(g_pm[0]) *m = &g_pm[(sr ^ sr >> 6) & 63];
     if (sr && m->serial == sr && vka_progsh_current(&m->ps)) ps = m->ps;
-    else { if (!vka_prog_shaders(p, &ps)) return 0; if (sr) { m->serial = sr; m->ps = ps; } }
-    if (ps.bad & (1u << st | VKA_BAD_MISSING)) { *bad |= 1u << st; return 1; }
+    else { if (!vka_prog_shaders(p, &ps)) return 0; if (sr && !(ps.bad & VKA_BAD_PENDING)) { m->serial = sr; m->ps = ps; } }
+    if (ps.bad & (1u << st | VKA_BAD_MISSING | VKA_BAD_PENDING)) { *bad |= 1u << st; return 1; }
     *out = ps.sh[st]; return 1;
 }
 // Vertex input: an attribute per input location the vertex shader reads (Location = NVN attribute index), each from its stream; an input no attribute feeds reads a zero buffer.
@@ -1668,7 +1668,11 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         // After the emulation: its indirect draw needs no mesh entry points, only a native one does
         if (mesh && dw->ind && (!vk.vkCmdDrawMeshTasksIndirectEXT || !vk.vkCmdDrawMeshTasksIndirectCountEXT)) SKIP("indirect mesh draw on a device without vkCmdDrawMeshTasksIndirect(Count)EXT: skipped");
     } else {
-        for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) SKIP("draw skipped: a program without shaders");
+        // Fritchii: a shader not translated yet may be translated in the background (its draws skipped meanwhile) when this draw goes into the open pass of
+        // targets drawn in the frames before (R.again), as pipelines are (nvn_recompile.c rj_defer)
+        extern _Thread_local int vka_rc_defer; vka_rc_defer = R.on && R.again && rt_same(rt, has_rt, &R.rt, R.has_rt);
+        for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) { vka_rc_defer = 0; SKIP("draw skipped: a program without shaders"); }
+        vka_rc_defer = 0;
         if (bad) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }   // a refused or missing shader (logged when it was made)
         if (!sh[0]) SKIP("draw with no vertex shader bound: skipped");
         if (sh[1] && (sh[1]->e->flags & DMSH_VK_F_MESH_PRIM)) SKIP("pixel shader %016llx reads per-primitive mesh outputs and is drawn with a vertex shader: skipped", (unsigned long long)sh[1]->key);
