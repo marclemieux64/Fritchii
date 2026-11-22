@@ -1087,7 +1087,11 @@ static int gfx_make(gval *g, const gkey_full *fk, size_t len, vka_shader *const 
     if (P && pstate_fill(P, sh, lay, k)) {   // (else logged by vka_shader_module)
         const int gpl = gpl_on() && !P->mesh && !P->vrs && !k->excl && !P->defout;   // (Fritchii: a vertex module with default outputs depends on the pixel shader: made whole)   // (a mesh pipeline is made whole: the libraries here are cut for vertex input pipelines; Lichii: so are those with a shading rate attachment or an exclusive scissor)
         // The pipeline cache may already hold the optimized one (made in an earlier run): then it is made at once, else linked from parts
-        if (mode == MK_FRAME && (gpl || async)) p = cache_probe(P);
+        // Fritchii: a draw that may be skipped (!wait) is not probed on the frame path: its build goes to the asynchronous threads, whose make takes the cache's
+        // pipeline as fast. On AMD 735 of 774 probes missed at ~3.4 ms each (1.2 s of a 90 s walk into new views, Kokiri 2026-11-22), and 5 % hits kept
+        // FRITCHII_PROBE_ADAPT from easing it. A hit only spared a frame's skip. FRITCHII_PROBE_SKIPPABLE=0: probed as before
+        const int probe = !(async && !wait && VKA_ENV("FRITCHII_PROBE_SKIPPABLE", 1));
+        if (mode == MK_FRAME && (gpl || async) && probe) p = cache_probe(P);
         if (!p && mode != MK_PREWARM && gpl) {
             uint64_t t1 = now_ns();
             t_lib_peek = async; p = gpl_link(P, k); t_lib_peek = 0;
