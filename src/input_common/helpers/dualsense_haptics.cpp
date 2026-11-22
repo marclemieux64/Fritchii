@@ -38,14 +38,22 @@ constexpr GUID FloatSubtype{
 struct Band {
     float amplitude{}, frequency{};
 };
+using Clock = std::chrono::steady_clock;
 struct Side {
     Band low{0.0f, 160.0f}, high{0.0f, 320.0f};
-    std::chrono::steady_clock::time_point updated{};
+    Clock::time_point updated{};
+    // RenHDrum's motor layer (src/dualsense/motor.rs), from the game's raw amplitudes: a heavy hit glides the low
+    // band toward 75 Hz (held while it stays above half its peak, at most 150 ms, then 60 ms back)
+    float raw_low{}, raw_hist[2]{};
+    bool heavy{};
+    float heavy_peak{};
+    Clock::time_point heavy_start{}, heavy_release{};
 };
 
 struct State {
     std::mutex mutex;
     std::array<Side, 2> target;
+    Clock::time_point boom_since{}; // both sides' low band at 0.7+ (and 200 Hz or less) since then: an explosion
     std::atomic<bool> started{false}, running{false};
     std::atomic<u32> sets{0};          // (the 5 s activity line)
     std::atomic<float> set_peak{0.0f};
@@ -176,6 +184,9 @@ void Play(IMMDevice* device) {
     struct Voice {
         double phase_low{}, phase_high{};
         float amp_low{}, amp_high{};
+        float freq_low{160.0f};           // glides (15 ms) toward the heavy hit's lowered frequency
+        float hp_x{}, hp_y{}, lp_y{};    // the explosion's 50-130 Hz noise (one-pole high and low pass)
+        u32 noise{0x9E3779B9u};
     };
     std::array<Voice, 2> voices{};
     const float ramp = 1.0f / (0.004f * rate); // amplitude follows the target over ~4 ms (RenHDrum's smoothing)
@@ -205,12 +216,32 @@ void Play(IMMDevice* device) {
         }
         std::array<Side, 2> target;
         float gain;
+        Clock::time_point boom_since;
         {
             std::scoped_lock lock{state.mutex};
             target = state.target;
             gain = state.gain;
+            boom_since = state.boom_since;
         }
         const auto now = std::chrono::steady_clock::now();
+        // Heavy hit weight per side, and the explosion's (both sides held 200 ms, 50 ms in)
+        std::array<float, 2> heavy_w{};
+        for (int s = 0; s < 2; ++s) {
+            const Side& t = target[s];
+            if (t.heavy) {
+                heavy_w[s] = 1.0f;
+            } else if (t.heavy_release != Clock::time_point{}) {
+                const float dt = std::chrono::duration<float, std::milli>(now - t.heavy_release).count();
+                heavy_w[s] = std::clamp(1.0f - dt / 60.0f, 0.0f, 1.0f);
+            }
+        }
+        float boom_w = 0.0f;
+        if (boom_since != Clock::time_point{}) {
+            const float held = std::chrono::duration<float, std::milli>(now - boom_since).count();
+            boom_w = std::clamp((held - 200.0f) / 50.0f, 0.0f, 1.0f);
+        }
+        const float glide = 1.0f - std::exp(-1.0f / (0.015f * rate));
+        const float hp_a = 1.0f / (1.0f + two_pi * 50.0f / rate), lp_a = 1.0f - std::exp(-two_pi * 130.0f / rate);
         for (auto& side : target) {
             if (now - side.updated > stale) {
                 side.low.amplitude = side.high.amplitude = 0.0f;
@@ -229,16 +260,29 @@ void Play(IMMDevice* device) {
                 };
                 v.amp_low = approach(v.amp_low, t.low.amplitude);
                 v.amp_high = approach(v.amp_high, t.high.amplitude);
-                v.phase_low += t.low.frequency / rate;
+                const float want_low = t.low.frequency - heavy_w[s] * (std::max)(t.low.frequency - 75.0f, 0.0f);
+                v.freq_low += (want_low - v.freq_low) * glide;
+                v.phase_low += v.freq_low / rate;
                 v.phase_high += t.high.frequency / rate;
                 v.phase_low -= std::floor(v.phase_low);
                 v.phase_high -= std::floor(v.phase_high);
                 // As RenHDrum: the two bands scaled down together when their amplitudes add past 1, then a 0.8 ceiling
                 const float sum = v.amp_low + v.amp_high;
                 const float norm = sum > 1.0f ? 1.0f / sum : 1.0f;
+                float low_sin = std::sin(two_pi * static_cast<float>(v.phase_low));
+                float noise = 0.0f;
+                if (boom_w > 0.0f) {   // RenHDrum's explosion: the low band saturated, and 50-130 Hz noise
+                    low_sin = (1.0f - boom_w) * low_sin + boom_w * std::tanh(low_sin * 1.25f);
+                    v.noise = v.noise * 1664525u + 1013904223u;
+                    const float white = static_cast<float>(v.noise >> 8) / 8388608.0f - 1.0f;
+                    v.hp_y = hp_a * (v.hp_y + white - v.hp_x);
+                    v.hp_x = white;
+                    v.lp_y += (v.hp_y - v.lp_y) * lp_a;
+                    noise = 0.15f * t.raw_low * boom_w * v.lp_y * 4.0f;
+                }
                 const float sample =
-                    norm * (v.amp_low * std::sin(two_pi * static_cast<float>(v.phase_low)) +
-                            v.amp_high * std::sin(two_pi * static_cast<float>(v.phase_high)));
+                    norm * (v.amp_low * low_sin +
+                            v.amp_high * std::sin(two_pi * static_cast<float>(v.phase_high))) + noise;
                 frame[2 + s] = std::clamp(std::clamp(sample, -1.0f, 1.0f) * 0.8f * gain, -1.0f, 1.0f);
                 out_peak = (std::max)(out_peak, std::abs(frame[2 + s]));
             }
@@ -317,7 +361,7 @@ bool DualSenseHaptics::Running() const {
 void DualSenseHaptics::Set(int side, float low_amplitude, float low_frequency, float high_amplitude,
                            float high_frequency) {
     State& state = GetState();
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = Clock::now();
     state.sets.fetch_add(1, std::memory_order_relaxed);
     const float peak = (std::max)(low_amplitude, high_amplitude);
     if (peak > state.set_peak.load(std::memory_order_relaxed)) {
@@ -339,7 +383,33 @@ void DualSenseHaptics::Set(int side, float low_amplitude, float low_frequency, f
         Side& t = state.target[s];
         t.low = {curve(low_amplitude), std::clamp(low_frequency, 10.0f, 2000.0f)};
         t.high = {curve(high_amplitude), std::clamp(high_frequency, 10.0f, 2000.0f)};
+        // RenHDrum's heavy hit (motor.rs): the low band jumps (0.12+ over two updates) to 0.30+, mostly low, at 220 Hz or less
+        const float al = std::clamp(low_amplitude, 0.0f, 1.0f), ah = std::clamp(high_amplitude, 0.0f, 1.0f);
+        const float prev2 = t.raw_hist[1];
+        t.raw_hist[1] = t.raw_hist[0];
+        t.raw_hist[0] = al;
+        t.raw_low = al;
+        if (!t.heavy && al >= 0.30f && al - prev2 >= 0.12f && ah / (al + ah) < 0.40f && low_frequency <= 220.0f) {
+            t.heavy = true;
+            t.heavy_peak = al;
+            t.heavy_start = now;
+        } else if (t.heavy) {
+            t.heavy_peak = (std::max)(t.heavy_peak, al);
+            if (al < 0.5f * t.heavy_peak || now - t.heavy_start > std::chrono::milliseconds(150)) {
+                t.heavy = false;
+                t.heavy_release = now;
+            }
+        }
         t.updated = now;
+    }
+    // RenHDrum's explosion: both sides' low band at 0.7+ and 200 Hz or less (held 200 ms in the synthesis)
+    const auto booming = [](const Side& t) { return t.raw_low >= 0.70f && t.low.frequency <= 200.0f; };
+    if (booming(state.target[0]) && booming(state.target[1])) {
+        if (state.boom_since == Clock::time_point{}) {
+            state.boom_since = now;
+        }
+    } else {
+        state.boom_since = {};
     }
 }
 
