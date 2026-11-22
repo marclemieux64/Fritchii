@@ -44,6 +44,7 @@ add_library(
     device_power_state.cpp
     device_power_state.h
     div_ceil.h
+    dualsense_effects.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
     jit_symbols.cpp

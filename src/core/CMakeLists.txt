@@ -14,6 +14,8 @@ add_library(core STATIC
     arm/symbols.h
     constants.cpp
     constants.h
+    oot_dualsense.cpp
+    oot_dualsense.h
     core.cpp
     core.h
     nvn_direct_choice.h

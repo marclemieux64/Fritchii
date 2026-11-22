@@ -115,7 +115,8 @@ private:
 
     /// Map of GUID of a list of corresponding virtual Joysticks
     ::Common::unordered_map<Common::UUID, std::vector<std::shared_ptr<SDLJoystick>>> joystick_map;
-    std::mutex joystick_map_mutex;
+    mutable std::mutex joystick_map_mutex;
+    mutable u32 effects_seen = 0; ///< Fritchii: the last DualSense effects block sent (common/dualsense_effects.h)
 
     std::atomic<bool> initialized = false;
     bool start_thread;

@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
+#include "common/dualsense_effects.h"
 #include "input_common/helpers/dualsense_haptics.h"
 #include "input_common/drivers/sdl_driver.h"
 
@@ -614,6 +615,19 @@ void SDLDriver::CloseJoystick(SDL_Joystick* sdl_joystick) {
 void SDLDriver::PumpEvents() const {
     if (initialized) {
         SDL_PumpEvents();
+        // Fritchii: a game feature's DualSense effects (triggers, lights: core/oot_dualsense.h) to every PS5 pad
+        Common::DualSenseEffects::Block block;
+        if (Common::DualSenseEffects::Take(effects_seen, block)) {
+            std::scoped_lock lock{joystick_map_mutex};
+            for (const auto& [key, joysticks] : joystick_map) {
+                for (const auto& joystick : joysticks) {
+                    SDL_Gamepad* const gamepad = joystick->GetSDLGameController();
+                    if (gamepad && SDL_GetGamepadType(gamepad) == SDL_GAMEPAD_TYPE_PS5) {
+                        SDL_SendGamepadEffect(gamepad, block.data(), static_cast<int>(block.size()));
+                    }
+                }
+            }
+        }
     }
 }
 

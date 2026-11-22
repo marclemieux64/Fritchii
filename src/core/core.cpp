@@ -25,6 +25,7 @@
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "core/oot_dualsense.h"
 #include "core/nvn_hook.h"
 
 #include "launch_timestamp_cache.h"
@@ -620,6 +621,7 @@ struct System::Impl {
     void ShutdownMainProcess() {
         // First: no hang report reads anything the teardown below frees.
         Common::Nx2Hitch::ClearHangHooks(this);
+        Core::OotDualSense::Stop(); // (reads guest memory)
         // Common::ShutdownWatch steps (a no-op unless the frontend armed the watch).
         Common::ShutdownWatch::Step("teardown: debug server");
         debug_service.reset();

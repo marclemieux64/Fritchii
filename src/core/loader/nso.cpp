@@ -26,6 +26,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/oot_dualsense.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 
@@ -384,6 +385,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
     }
     if (oot_main) {
+        Core::OotDualSense::Start(system, load_base + module_start); // (adaptive triggers and lights)
         const u64 scale_address =
             oot_high_refresh_scale ? load_base + module_start + *oot_high_refresh_scale : 0;
         process.SetOotHighRefreshScaleAddress(scale_address);
